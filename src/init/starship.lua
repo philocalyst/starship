@@ -21,6 +21,12 @@ end
 -- direct/fast render, no background refresh/repaint).
 -- Transient filters never use coroutines (Clink does not support async during
 -- transients).
+--
+-- Live updates (root `refresh_interval`): not wired for Clink. Clink can in
+-- principle refresh the prompt periodically (a coroutine plus
+-- clink.refilterprompt), but that path has no Windows/Clink runtime available
+-- to verify against here (see the note in src/test/init_async/lua_static.rs),
+-- so the interval is left as a no-op rather than shipping unverified behavior.
 
 local use_async = false
 local starship_async = os.getenv("STARSHIP_ASYNC")

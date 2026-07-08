@@ -170,10 +170,57 @@ if [[ $STARSHIP_ASYNC != 0 ]]; then
         zle reset-prompt
     }
 
+    # Live-update tick: while the user sits idle at the prompt, periodically
+    # re-paint so dynamic modules (e.g. `time`) keep advancing. A tick simply
+    # reverts PROMPT/RPROMPT to the instant (CacheRead) expressions and
+    # `zle reset-prompt`s -- this reuses the fast CacheRead paint, which
+    # computes fast/dynamic modules live and replays slow modules (git, etc.)
+    # from the on-disk cache, so no background `--async` render is launched
+    # (that would recompute the slow modules every tick).
+    typeset -g _STARSHIP_TMOUT=0 _STARSHIP_PRESERVED_TRAPALRM=
+
+    # Preserve any pre-existing user TRAPALRM so we chain to it rather than
+    # clobbering it.
+    if (( ${+functions[TRAPALRM]} )); then
+        functions[_starship_preserved_trapalrm]=$functions[TRAPALRM]
+        _STARSHIP_PRESERVED_TRAPALRM=1
+    fi
+
+    TRAPALRM() {
+        # Chain to any previously-defined user TRAPALRM first.
+        (( _STARSHIP_PRESERVED_TRAPALRM )) && _starship_preserved_trapalrm "$@"
+        # Only repaint while the line editor is active, and avoid disrupting
+        # completion menus / incremental search where a reset-prompt would
+        # interfere.
+        if zle && [[ -z $WIDGET || ( $WIDGET != *complete* && $WIDGET != *search* ) ]]; then
+            PROMPT=$_STARSHIP_INSTANT_PROMPT
+            RPROMPT=$_STARSHIP_INSTANT_RPROMPT
+            zle reset-prompt
+        fi
+    }
+
+    # (Re)arm the live-update timer from the configured `refresh_interval`
+    # (whole seconds; 0 = disabled). Queried on every precmd so live config
+    # changes take effect. Preserves a pre-existing user TMOUT: only our own
+    # value is managed here, and TMOUT is restored/unset when disabled.
+    _starship_async_arm_timer() {
+        local interval=$(::STARSHIP:: refresh-interval 2>/dev/null)
+        if [[ $interval == <1-> ]]; then
+            TMOUT=$interval
+            _STARSHIP_TMOUT=$interval
+        elif (( _STARSHIP_TMOUT )); then
+            # We previously armed it; disarm cleanly (only if unchanged by the
+            # user in the meantime).
+            (( TMOUT == _STARSHIP_TMOUT )) && unset TMOUT
+            _STARSHIP_TMOUT=0
+        fi
+    }
+
     # precmd: install instant paints, launch (or relaunch) the two independent
     # background renders.
     _starship_async_refresh() {
         _starship_async_cancel
+        _starship_async_arm_timer
         PROMPT=$_STARSHIP_INSTANT_PROMPT
         RPROMPT=$_STARSHIP_INSTANT_RPROMPT
 
@@ -200,9 +247,15 @@ if [[ $STARSHIP_ASYNC != 0 ]]; then
 
     add-zsh-hook precmd _starship_async_refresh
 
-    # Cleanup on exit: kill any still-running async jobs and close their fds.
+    # Cleanup on exit: kill any still-running async jobs and close their fds,
+    # and disarm the live-update timer (restoring TMOUT only if it's still our
+    # own value, so a user TMOUT set later is left alone).
     _starship_async_cleanup() {
         _starship_async_cancel
+        if (( _STARSHIP_TMOUT )); then
+            (( TMOUT == _STARSHIP_TMOUT )) && unset TMOUT
+            _STARSHIP_TMOUT=0
+        fi
     }
     add-zsh-hook zshexit _starship_async_cleanup
 fi

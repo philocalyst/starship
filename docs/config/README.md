@@ -216,6 +216,7 @@ This is the list of prompt-wide configuration options.
 | `right_format`    | `''`                           | See [Enable Right Prompt](../advanced-config/#enable-right-prompt)                                                                                                                 |
 | `scan_timeout`    | `30`                           | Timeout for starship to scan files (in milliseconds).                                                                                                                              |
 | `command_timeout` | `500`                          | Timeout for commands executed by starship (in milliseconds).                                                                                                                       |
+| `refresh_interval`| `0`                            | How often (in whole seconds) the shell repaints the prompt so live modules such as [`time`](#time) keep updating while you sit at the prompt; `0` disables it. Supported on Zsh, Fish, and Xonsh (see note below). |
 | `add_newline`     | `true`                         | Inserts blank line between shell prompts.                                                                                                                                          |
 | `palette`         | `''`                           | Sets which color palette from `palettes` to use.                                                                                                                                   |
 | `palettes`        | `{}`                           | Collection of color palettes that assign [colors](../advanced-config/#style-strings) to user-defined names. Note that color palettes cannot reference their own color definitions. |
@@ -224,6 +225,15 @@ This is the list of prompt-wide configuration options.
 > [!TIP]
 > If you have symlinks to networked filesystems, consider setting
 > `follow_symlinks` to `false`.
+
+> [!NOTE]
+> `refresh_interval` makes the shell repaint the prompt on a timer so dynamic
+> modules keep updating while you sit at the prompt (the [`time`](#time) module
+> is the canonical example). Each tick reuses the fast async paint, so slow
+> modules are served from cache rather than recomputed. It is currently
+> supported on **Zsh**, **Fish**, and **Xonsh**; Bash, PowerShell, Elvish, and
+> Cmd/Clink cannot repaint the prompt while it sits idle, so the setting is a
+> no-op there.
 
 ### Example
 
@@ -241,6 +251,10 @@ scan_timeout = 10
 
 # Disable the blank line at the start of the prompt
 add_newline = false
+
+# Repaint the prompt every second so live modules (e.g. time) keep updating
+# while you sit at the prompt (Zsh/Fish/Xonsh). 0 (the default) disables it.
+refresh_interval = 1
 
 # Set 'foo' as custom color palette
 palette = 'foo'

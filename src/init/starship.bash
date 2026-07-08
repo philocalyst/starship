@@ -197,6 +197,10 @@ PS2="$(::STARSHIP:: prompt --continuation)"
 #   Bash has no way to force readline to re-expand PS1 mid-line, so this only
 #   makes the refreshed prompt visible starting with the *next* prompt draw
 #   (see _starship_get_prompt); ble.sh, if attached, can act on WINCH sooner.
+# - Live updates (root `refresh_interval`): not wired for Bash for the same
+#   reason -- readline won't re-expand PS1 mid-line, so a periodic timer can't
+#   advance a live module (e.g. `time`) while the user sits at the prompt
+#   without a keypress. The interval is therefore a no-op here.
 # - Job counting: launched after NUM_JOBS calc; disown prevents it from
 #   appearing in `jobs` for subsequent counts (combined with the jobs
 #   &>/dev/null workaround already present).

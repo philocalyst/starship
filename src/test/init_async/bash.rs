@@ -355,3 +355,16 @@ echo "EXIT_TRAP=$(trap -p EXIT)"
 
     assert_eq!(exit_trap_line, "EXIT_TRAP=", "STARSHIP_ASYNC=0 should install no EXIT trap");
 }
+
+/// Live updates (`refresh_interval`) are intentionally a no-op for Bash:
+/// readline won't re-expand PS1 mid-line, so a periodic timer cannot advance a
+/// live module while the user idles. The init script must not wire a ticker
+/// (i.e. must not call `starship refresh-interval`).
+#[test]
+fn live_update_tick_not_wired_for_bash() {
+    let init = substituted_init_script("src/init/starship.bash");
+    assert!(
+        !init.contains("refresh-interval"),
+        "starship.bash calls `starship refresh-interval`: a live-update ticker was wired for a shell that can't repaint the prompt mid-idle"
+    );
+}

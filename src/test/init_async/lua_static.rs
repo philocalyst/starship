@@ -283,3 +283,15 @@ fn get_async_prompt_forwards_to_clink_promptcoroutine() {
         "get_async_prompt no longer appears to forward its func argument to clink.promptcoroutine"
     );
 }
+
+/// Live updates (`refresh_interval`) are currently a no-op for Clink (no
+/// Windows/Clink runtime is available to verify a periodic-refresh coroutine),
+/// so the init must not call `starship refresh-interval`.
+#[test]
+fn live_update_tick_not_wired_for_clink() {
+    let src = read_target();
+    assert!(
+        !src.contains("refresh-interval"),
+        "starship.lua calls `starship refresh-interval`: a live-update ticker was wired for a runtime we can't verify here"
+    );
+}

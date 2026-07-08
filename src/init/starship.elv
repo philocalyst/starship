@@ -95,3 +95,11 @@ set edit:rprompt = {
     var cmd-duration = (printf "%.0f" (* $edit:command-duration 1000))
     ::STARSHIP:: prompt --right --jobs=$num-bg-jobs --cmd-duration=$cmd-duration --status=$cmd-status-code --logical-path=$pwd
 }
+
+# Live-update tick (root `refresh_interval`): not wired for Elvish. A periodic
+# repaint would need the prompt *content* to be recomputed while the editor
+# sits idle, but Elvish evaluates the prompt closures once per edit cycle and
+# `edit:redraw &full` reuses that result mid-cycle (a background goroutine can
+# call it without error, but the clock stays frozen until the next command).
+# Elvish exposes no timer/hook that recomputes the prompt during an idle read,
+# so live updates are a no-op here; the async refresh above is unaffected.

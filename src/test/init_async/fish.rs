@@ -424,6 +424,7 @@ fn starship_async_zero_disables_all_async_machinery() {
 echo "EXPORTED:$STARSHIP_ASYNC"
 functions -q __starship_async_repaint; and echo 'HANDLER_DEFINED:yes'; or echo 'HANDLER_DEFINED:no'
 functions -q __starship_async_cleanup; and echo 'CLEANUP_DEFINED:yes'; or echo 'CLEANUP_DEFINED:no'
+functions -q __starship_tick_repaint; and echo 'TICK_HANDLER:yes'; or echo 'TICK_HANDLER:no'
 fish_prompt >/dev/null
 set -q __starship_async_pid; and echo 'FIRED:yes'; or echo 'FIRED:no'
 "#,
@@ -441,4 +442,100 @@ set -q __starship_async_pid; and echo 'FIRED:yes'; or echo 'FIRED:no'
     assert!(out.contains("HANDLER_DEFINED:no"), "got: '{out}'");
     assert!(out.contains("CLEANUP_DEFINED:no"), "got: '{out}'");
     assert!(out.contains("FIRED:no"), "got: '{out}'");
+    // The live-update tick machinery is likewise part of the async block, so
+    // its per-session handler must not be engaged under STARSHIP_ASYNC=0.
+    assert!(out.contains("TICK_HANDLER:no"), "got: '{out}'");
+}
+
+/// The fish live-update tick primitive works end to end: arming it spawns a
+/// background sleep that, when the interval elapses, twiddles this session's
+/// per-session tick universal variable -- the signal whose `--on-variable`
+/// handler drives `commandline -f repaint` (a fast CacheRead redraw that
+/// advances a live module like `time`). Killing it clears the pid.
+#[test]
+fn live_tick_arm_fires_signal_and_kill_clears_it() {
+    let env = FishEnv::new();
+    let root = env.path().join("session_tick_fire");
+    std::fs::create_dir_all(&root).unwrap();
+    let tick_log = root.join("tick.log");
+    std::fs::write(&tick_log, "").unwrap();
+
+    let script = format!(
+        r#"{source}
+function __probe_tick --on-variable $__starship_tick_var
+    echo TICK_FIRED >> '{log}'
+end
+__starship_arm_tick 1
+set -q __starship_tick_pid; and echo 'ARMED:yes'; or echo 'ARMED:no'
+# Service the event loop long enough for the 1s sleep to elapse and deliver
+# the universal-variable notification (same idle-poll idiom as the leak test).
+for i in (seq 1 60)
+    sleep 0.05
+end
+__starship_kill_tick
+set -q __starship_tick_pid; and echo 'AFTER_KILL_PID:set'; or echo 'AFTER_KILL_PID:unset'
+"#,
+        source = env.source_snippet(),
+        log = tick_log.display(),
+    );
+    let out = env.run_in(&root, &script);
+    let fired = std::fs::read_to_string(&tick_log).unwrap_or_default();
+
+    assert!(
+        out.contains("ARMED:yes"),
+        "arming the tick did not set __starship_tick_pid; out: {out}"
+    );
+    assert!(
+        fired.contains("TICK_FIRED"),
+        "tick did not twiddle its repaint signal within ~3s; out: {out}"
+    );
+    assert!(
+        out.contains("AFTER_KILL_PID:unset"),
+        "the tick pid was not cleared after the tick fired/was killed; out: {out}"
+    );
+}
+
+/// The tick is opt-in: `fish_prompt` only arms it when the configured
+/// `refresh_interval` is positive; with the default `0` it does not.
+#[test]
+fn live_tick_armed_only_when_refresh_interval_positive() {
+    let env = FishEnv::new();
+
+    for (interval, expect_armed) in [("0", false), ("1", true)] {
+        let root = env.path().join(format!("session_gate_{interval}"));
+        std::fs::create_dir_all(&root).unwrap();
+        let cfg = root.join("starship.toml");
+        std::fs::write(
+            &cfg,
+            format!("refresh_interval = {interval}\nformat = \"$character\"\n"),
+        )
+        .unwrap();
+
+        let script = format!(
+            r#"{source}
+set STARSHIP_CMD_STATUS 0
+set STARSHIP_CMD_PIPESTATUS 0
+set STARSHIP_KEYMAP insert
+set STARSHIP_DURATION 0
+set STARSHIP_JOBS 0
+fish_prompt >/dev/null
+set -q __starship_tick_pid; and echo 'TICK_ARMED:yes'; or echo 'TICK_ARMED:no'
+# Be a good citizen: tear down anything the prompt draw spawned.
+__starship_kill_tick
+set -q __starship_async_pid; and kill $__starship_async_pid 2>/dev/null
+"#,
+            source = env.source_snippet(),
+        );
+        let mut cmd = env.command_in(&root, &script);
+        cmd.env("STARSHIP_CONFIG", &cfg);
+        let output = cmd.output().expect("failed to run fish -c");
+        let out = String::from_utf8_lossy(&output.stdout).into_owned()
+            + &String::from_utf8_lossy(&output.stderr);
+
+        let armed = out.contains("TICK_ARMED:yes");
+        assert_eq!(
+            armed, expect_armed,
+            "refresh_interval={interval}: expected tick armed={expect_armed}; out: {out}"
+        );
+    }
 }

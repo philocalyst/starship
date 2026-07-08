@@ -61,6 +61,40 @@ function __starship_kill_async
     end
 end
 
+function __starship_arm_tick --argument-names interval
+    # Live-update tick: fish has no SIGALRM/TMOUT, so we self-reschedule a
+    # background `sleep $interval` that twiddles a per-session universal var
+    # when it fires; the --on-variable handler then repaints. A tick repaint
+    # re-runs fish_prompt via the (fast) plain prompt CacheRead path, so
+    # dynamic modules (e.g. time) advance while slow modules stay served from
+    # the cache -- a tick never fires a background --async refresh.
+    #
+    # The tick var is scoped by $fish_pid (via $__starship_tick_var below) for
+    # the same reason as the async ready var: universal vars reach every fish
+    # process, so an unscoped name would tick every session/tab.
+    # Guard against overlapping sleeps: only arm if none is pending.
+    if set -q __starship_tick_pid
+        return
+    end
+    set -l tickvar $__starship_tick_var
+    # Background a plain sleep in a forked block (not a fresh `fish -c`, which
+    # would re-read the user's config every tick); setting the universal var
+    # from the child notifies this session's --on-variable handler.
+    begin
+        sleep $interval
+        set -U $tickvar (random)(random)
+    end &
+    set -g __starship_tick_pid $last_pid
+    disown $last_pid 2>/dev/null
+end
+
+function __starship_kill_tick
+    if set -q __starship_tick_pid
+        kill $__starship_tick_pid 2>/dev/null
+        set -e __starship_tick_pid
+    end
+end
+
 function fish_prompt
     switch "$fish_key_bindings"
         case fish_hybrid_key_bindings fish_vi_key_bindings fish_helix_key_bindings
@@ -95,6 +129,13 @@ function fish_prompt
                 set -g __starship_async_skip_fire 0
             else
                 __starship_fire_async $STARSHIP_CMD_STATUS "$STARSHIP_CMD_PIPESTATUS" $STARSHIP_KEYMAP "$STARSHIP_DURATION" "$STARSHIP_JOBS"
+            end
+            # (Re)arm the live-update tick from the configured refresh_interval
+            # (whole seconds; 0 = disabled). Queried each draw so live config
+            # changes take effect; __starship_arm_tick no-ops if one is pending.
+            set -l __starship_interval (::STARSHIP:: refresh-interval 2>/dev/null)
+            if string match -qr '^[1-9][0-9]*$' -- "$__starship_interval"
+                __starship_arm_tick $__starship_interval
             end
         end
     end
@@ -254,13 +295,45 @@ if test "$STARSHIP_ASYNC" != "0"
         commandline -f repaint
     end
 
+    # Live-update tick var: the background sleep in __starship_arm_tick twiddles
+    # this when the refresh interval elapses. Scoped by $fish_pid for the same
+    # cross-session reason as the ready var above.
+    if __starship_fish_version_at_least 4.0
+        set -g __starship_tick_var "__starship_tick_$fish_pid"
+    else
+        set -g __starship_tick_var "__starship_tick_"%self
+    end
+
+    function __starship_tick_repaint --on-variable $__starship_tick_var
+        # The interval elapsed; the sleep process has exited, so clear its pid to
+        # allow re-arming, then repaint. A tick only wants the fast CacheRead
+        # paint, so set skip_fire (like __starship_async_repaint) to keep the
+        # following fish_prompt from launching a background --async refresh; that
+        # same fish_prompt re-arms the next tick.
+        set -e __starship_tick_pid
+        if test "$TRANSIENT" = "1"; or test "$RIGHT_TRANSIENT" = "1"
+            return
+        end
+        set -g __starship_async_skip_fire 1
+        commandline -f repaint
+    end
+
+    # Kill any pending tick before a command runs; the next prompt re-arms it.
+    function __starship_tick_preexec --on-event fish_preexec
+        __starship_kill_tick
+    end
+
     # Cleanup on exit to avoid leaking uvars or pending jobs. Erase this
-    # session's own ready var only -- never touch other sessions' entries.
+    # session's own ready/tick vars only -- never touch other sessions' entries.
     function __starship_async_cleanup --on-event fish_exit
         if functions -q __starship_kill_async
             __starship_kill_async
         end
+        if functions -q __starship_kill_tick
+            __starship_kill_tick
+        end
         set -e $__starship_async_ready_var 2>/dev/null
+        set -e $__starship_tick_var 2>/dev/null
     end
 end
 

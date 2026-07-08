@@ -99,8 +99,48 @@ def _starship_on_pre_prompt(**kwargs):
     t.start()
 
 
+def _starship_refresh_interval():
+    """Configured `refresh_interval` (whole seconds; 0 = disabled), read once."""
+    try:
+        return int(__xonsh__.subproc_captured_stdout(
+            ["::STARSHIP::", "refresh-interval"]
+        ).strip())
+    except Exception:
+        return 0
+
+
+def _starship_ticker(interval):
+    """Live-update tick: while the user sits at the prompt, recompute the prompt
+    every `interval` seconds via a fast CacheRead call (fast modules like `time`
+    recompute live; slow ones are served from cache -- no `--async` refresh) and
+    ask prompt_toolkit to redraw, so the clock advances with no keypress.
+    """
+    import time as _time
+    while True:
+        _time.sleep(interval)
+        try:
+            left = _starship_refresh(right=False, use_async=False)
+            right = _starship_refresh(right=True, use_async=False)
+            global _STARSHIP_LEFT, _STARSHIP_RIGHT
+            with _STARSHIP_LOCK:
+                _STARSHIP_LEFT = left
+                _STARSHIP_RIGHT = right
+            _starship_invalidate()
+        except Exception:
+            # Never let a background tick affect the shell or future prompts.
+            pass
+
+
 if _STARSHIP_ASYNC_ENABLED:
     events.on_pre_prompt(_starship_on_pre_prompt)
+    # Start the live-update ticker if enabled. It's a persistent daemon thread
+    # (prompt_toolkit's invalidate() no-ops when no app is active, e.g. while a
+    # command runs), so no per-prompt arming/cancelling is needed.
+    _starship_interval = _starship_refresh_interval()
+    if _starship_interval > 0:
+        threading.Thread(
+            target=_starship_ticker, args=(_starship_interval,), daemon=True
+        ).start()
 
 
 def starship_prompt():

@@ -590,3 +590,15 @@ Write-Host "DISABLED_JOB_COUNT=$jobCount"
          DISABLED_HAS_SLOW={disabled_has_slow:?}; log: {log}"
     );
 }
+
+/// Live updates (`refresh_interval`) are intentionally a no-op for PowerShell:
+/// there is no thread-safe way to drive PSReadLine's InvokePrompt from a
+/// periodic timer, so the init must not wire a ticker (no `refresh-interval`).
+#[test]
+fn live_update_tick_not_wired_for_powershell() {
+    let init = substituted_init_script("src/init/starship.ps1");
+    assert!(
+        !init.contains("refresh-interval"),
+        "starship.ps1 calls `starship refresh-interval`: a live-update ticker was wired for a shell that can't repaint the prompt mid-idle"
+    );
+}

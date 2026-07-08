@@ -24,6 +24,12 @@ pub struct StarshipRootConfig {
     pub continuation_prompt: String,
     pub scan_timeout: u64,
     pub command_timeout: u64,
+    /// How often (in whole seconds) the shell should repaint the prompt so that
+    /// live modules (e.g. `time`) keep updating while you sit at the prompt.
+    /// `0` (the default) disables live updates. Requires an async-capable shell
+    /// (see the `init` scripts); each tick reuses the fast async paint, so slow
+    /// modules are served from cache rather than recomputed.
+    pub refresh_interval: u64,
     pub add_newline: bool,
     pub follow_symlinks: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -161,6 +167,7 @@ impl Default for StarshipRootConfig {
             internal_profiles: default_profiles(),
             scan_timeout: 30,
             command_timeout: 500,
+            refresh_interval: 0,
             add_newline: true,
             follow_symlinks: true,
             palette: None,

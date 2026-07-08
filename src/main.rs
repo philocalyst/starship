@@ -154,6 +154,10 @@ enum Commands {
     /// Prints time in milliseconds
     #[clap(hide = true)]
     Time,
+    /// Prints how often (in whole seconds) the shell should repaint the prompt
+    /// to keep live modules updating; `0` means live updates are disabled.
+    #[clap(hide = true)]
+    RefreshInterval,
     /// Prints timings of all active modules
     Timings(Properties),
     /// Toggle a given starship module
@@ -292,6 +296,9 @@ fn main() {
                 Some(time) => println!("{}", time.as_millis()),
                 None => println!("{}", -1),
             }
+        }
+        Commands::RefreshInterval => {
+            println!("{}", Context::default().root_config.refresh_interval);
         }
         Commands::Explain(props) => print::explain(props),
         Commands::Timings(props) => print::timings(props),

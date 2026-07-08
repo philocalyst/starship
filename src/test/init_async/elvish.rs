@@ -417,3 +417,16 @@ fn no_leftover_starship_processes_after_full_cycle() {
     let pattern = format!("{} prompt", STARSHIP_BIN.display());
     assert_no_orphaned_processes(&pattern, env.scratch.path());
 }
+
+/// Live updates (`refresh_interval`) are intentionally a no-op for Elvish:
+/// there is no primitive to recompute the prompt while the editor sits idle
+/// (`edit:redraw` reuses the per-edit-cycle prompt result), so the init script
+/// must not install any background ticker/timer for it.
+#[test]
+fn live_update_tick_not_wired_for_elvish() {
+    let init = substituted_init_script("src/init/starship.elv");
+    assert!(
+        !init.contains("refresh-interval"),
+        "starship.elv calls `starship refresh-interval`: a live-update ticker was wired for a shell that can't repaint the prompt mid-idle"
+    );
+}

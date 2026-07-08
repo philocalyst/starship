@@ -141,9 +141,16 @@ struct XonshScratchConfig<'a> {
 /// output is our unique per-render marker: a genuine re-render must change
 /// it, whereas replayed/cached/unchanged output would not.
 fn xonsh_config() -> String {
+    xonsh_config_with_refresh(0)
+}
+
+/// Like [`xonsh_config`], but also sets the root `refresh_interval` (whole
+/// seconds) that drives the live-update tick.
+fn xonsh_config_with_refresh(refresh_interval: u64) -> String {
     let mut root = StarshipRootConfig::default();
     root.format = "$custom$character".to_string();
     root.right_format = "$time".to_string();
+    root.refresh_interval = refresh_interval;
 
     let scratch = XonshScratchConfig {
         root,
@@ -779,4 +786,34 @@ fn abrupt_kill_mid_refresh_leaves_no_zombies_or_corrupt_cache() {
         }
     }
     assert!(corrupted.is_empty(), "corrupted entries={corrupted:?}");
+}
+
+// ============================================================================
+// CHECK: live updates -- with refresh_interval > 0 the background ticker
+// recomputes the prompt and invalidates prompt_toolkit on its own timer, so
+// the live `time` module (right prompt, microsecond format) advances while the
+// user sits idle, with no keypress.
+// ============================================================================
+
+#[test]
+fn live_tick_advances_time_module_while_idle() {
+    let _ = &*STARSHIP_BIN;
+    let env = XonshEnv::new();
+    // The default config has refresh_interval = 0; enable the tick.
+    std::fs::write(&env.config, xonsh_config_with_refresh(1)).unwrap();
+
+    let mut session = env.spawn_and_source("1");
+    // Idle: send nothing. Poll until the ticker has repainted at least three
+    // distinct microsecond clock values on its own.
+    let clock = r"\d\d:\d\d:\d\d\.\d{3}";
+    let ticked =
+        session.wait_until(Duration::from_secs(10), |t| super::unique_matches(t, clock).len() >= 3);
+
+    cleanly_exit(&mut session);
+
+    assert!(
+        ticked,
+        "xonsh prompt did not repaint on its own timer: fewer than 3 distinct clock values while idle (saw {:?})",
+        super::unique_matches(&session.raw_transcript(), clock)
+    );
 }

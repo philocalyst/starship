@@ -562,3 +562,87 @@ fn left_slow_markers(text: &str) -> std::collections::BTreeSet<String> {
         .collect();
     all_slow.difference(&rslow_suffixes).cloned().collect()
 }
+
+/// Distinct `HH:MM:SS` clock values painted so far -- how many times the live
+/// `time` module has advanced on screen.
+fn clock_values(text: &str) -> std::collections::BTreeSet<String> {
+    unique_matches(text, r"\d\d:\d\d:\d\d")
+}
+
+/// A config whose only visible module is the real `time` module -- which is
+/// fast, so it is never recorded in the async cache and is recomputed live on
+/// every paint -- plus a `refresh_interval`, so a live tick makes the
+/// displayed clock advance without any user input.
+fn config_time(refresh_interval: u64) -> String {
+    format!(
+        r#"add_newline = false
+refresh_interval = {refresh_interval}
+format = "$time$character"
+[time]
+disabled = false
+format = "[$time]($style) "
+time_format = "%H:%M:%S"
+[character]
+success_symbol = "[>](green)"
+"#
+    )
+}
+
+/// With `refresh_interval > 0`, the shell repaints on its own `TMOUT`/
+/// `TRAPALRM` timer while the user sits idle (no keypress), so a live module
+/// like `time` advances -- the clock shows more than one distinct value
+/// across a few seconds of idling. This is the core "live update" behavior.
+#[test]
+fn live_tick_advances_time_module_while_idle() {
+    let env = ZshEnv::new();
+    let mut session = env.spawn(&config_time(1), "1");
+    // Idle: send nothing at all. Poll (which just drains pty output) until at
+    // least two distinct clock values have been painted by the timer.
+    let ticked = session.wait_until(Duration::from_secs(8), |t| clock_values(t).len() >= 2);
+    session.send("exit\r");
+    session.pump(Duration::from_secs(1));
+    assert!(
+        ticked,
+        "prompt did not repaint on its own timer: fewer than 2 distinct clock values while idle (saw {:?})",
+        clock_values(&session.raw_transcript())
+    );
+}
+
+/// The tick is opt-in: with the default `refresh_interval = 0` no zsh timer
+/// (`TMOUT`) is armed, and with a positive value it is armed to that value.
+#[test]
+fn live_tick_arms_tmout_only_when_configured() {
+    let env = ZshEnv::new();
+
+    let mut off = env.spawn(&config_time(0), "1");
+    off.send_and_pump(
+        "print -r -- TMOUT_IS:${TMOUT:-unset}:END\r",
+        Duration::from_millis(500),
+    );
+    off.send("exit\r");
+    off.pump(Duration::from_secs(1));
+    assert!(
+        off.raw_transcript().contains("TMOUT_IS:unset:END"),
+        "TMOUT was armed despite refresh_interval=0 (saw {:?})",
+        regex::Regex::new(r"TMOUT_IS:[^:]*:END")
+            .unwrap()
+            .find(&off.raw_transcript())
+            .map(|m| m.as_str())
+    );
+
+    let mut on = env.spawn(&config_time(1), "1");
+    on.send_and_pump(
+        "print -r -- TMOUT_IS:${TMOUT:-unset}:END\r",
+        Duration::from_millis(500),
+    );
+    on.send("exit\r");
+    on.pump(Duration::from_secs(1));
+    assert!(
+        on.raw_transcript().contains("TMOUT_IS:1:END"),
+        "TMOUT not armed to the configured refresh_interval=1 (saw {:?})",
+        regex::Regex::new(r"TMOUT_IS:[^:]*:END")
+            .unwrap()
+            .find(&on.raw_transcript())
+            .map(|m| m.as_str())
+    );
+}

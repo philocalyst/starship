@@ -209,6 +209,12 @@ $null = New-Module starship {
     # We fire background --async jobs (Refresh) to populate cache, then repaint
     # the prompt in place (without waiting for the next line) once the job
     # finishes, mirroring the async repaint bash/zsh/fish implement natively.
+    #
+    # Live updates (root `refresh_interval`): not wired for PowerShell. In-place
+    # repaint here is a one-shot InvokePrompt driven off the OnIdle event after a
+    # refresh lands; there is no thread-safe way to drive InvokePrompt from a
+    # periodic timer (it must run on the pipeline thread), so a live module such
+    # as `time` can't be advanced while the user idles. The interval is a no-op.
     if (-not (Test-Path Env:STARSHIP_ASYNC) -or [string]::IsNullOrEmpty($env:STARSHIP_ASYNC)) {
         $env:STARSHIP_ASYNC = "1"
     }
