@@ -154,7 +154,9 @@ $null = New-Module starship {
                 "$([char]0x1B)[1;32m❯$([char]0x1B)[0m "
             }
         } else {
-            Invoke-Native -Executable ::STARSHIP:: -Arguments $arguments
+            $p = Invoke-Native -Executable ::STARSHIP:: -Arguments $arguments
+            __starship_fire_async $arguments
+            $p
         }
 
         # Set the number of extra lines in the prompt for PSReadLine prompt redraw.
@@ -201,6 +203,149 @@ $null = New-Module starship {
 
     # Set up the session key that will be used to store logs
     $ENV:STARSHIP_SESSION_KEY = -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 16 | ForEach-Object { [char]$_ })
+
+    # Async prompt support (in-place repaint via PSReadLine::InvokePrompt).
+    # Plain prompt calls become CacheRead when STARSHIP_ASYNC=1.
+    # We fire background --async jobs (Refresh) to populate cache, then repaint
+    # the prompt in place (without waiting for the next line) once the job
+    # finishes, mirroring the async repaint bash/zsh/fish implement natively.
+    if (-not (Test-Path Env:STARSHIP_ASYNC) -or [string]::IsNullOrEmpty($env:STARSHIP_ASYNC)) {
+        $env:STARSHIP_ASYNC = "1"
+    }
+
+    # In-place repaint requires PSReadLine's InvokePrompt (PSReadLine 2.1+).
+    # If it isn't available we still fire the async job (it's harmless and
+    # keeps the cache warm), we just can't repaint until the next prompt draw.
+    #
+    # IMPORTANT, confirmed by direct testing: on this platform (verified on
+    # pwsh 7.7-preview/macOS; PSReadLine/PSReadLine#1092 reports the same
+    # class of issue), PowerShell.OnIdle stops firing for the rest of the
+    # session as soon as the background job below launches the real
+    # `starship prompt --async` child process -- this reproduces identically
+    # whether the process is launched via Start-ThreadJob, Start-Job, or
+    # System.Diagnostics.Process directly from the main thread, so it is not
+    # fixable by changing how the job is started. In practice this means the
+    # OnIdle handler registered in __starship_fire_async below is very likely
+    # to never fire on non-Windows hosts once real work is queued, and the
+    # cache-warm value is only picked up on the *next* natural prompt draw
+    # instead of being repainted in place. That degraded behavior is still
+    # correct (never stale, never wrong -- just not instant), so the handler
+    # is left in place as a best-effort win for hosts where it does work,
+    # rather than special-cased off by platform.
+
+    # The background refresh must be a Start-ThreadJob, not a Start-Job: a
+    # Start-Job's .State is a remoting-serialized snapshot that, verified by
+    # direct testing, never updates as observed from inside a
+    # Register-EngineEvent/PowerShell.OnIdle action in this process -- the
+    # OnIdle handler would poll a Start-Job forever and never see it leave
+    # "Running", so the repaint (and the cache-populating job itself) would
+    # never be reaped. Start-ThreadJob runs in-process with no serialization
+    # layer, so its .State is visible immediately from any scope. ThreadJob
+    # ships with PowerShell 7+ but isn't guaranteed on older installs; if it's
+    # missing, skip the OnIdle/repaint machinery entirely (same fallback
+    # philosophy as $__starship_can_repaint above) rather than register a
+    # handler that can never fire.
+    $script:__starship_has_threadjob = $null -ne (Get-Command Start-ThreadJob -ErrorAction SilentlyContinue)
+    $script:__starship_can_repaint = $script:__starship_can_repaint -and $script:__starship_has_threadjob
+
+    $script:__starship_async_job = $null
+
+    function __starship_cleanup_async {
+        # Removes the tracked job regardless of state (Running/Completed/
+        # Failed/Stopped), so finished jobs never pile up in `Get-Job`.
+        #
+        # Deliberately does NOT use Register-ObjectEvent on the job itself:
+        # in testing, a live event subscription bound to a Start-Job object
+        # that is still pending when the pwsh runspace closes (session exit)
+        # reliably crashes the whole process (PSObjectDisposedException /
+        # FailFast during RunspaceClosingNotification, since the event
+        # manager's teardown races the job's own disposal). Polling via
+        # PowerShell.OnIdle (see below) never binds an event to the job, so
+        # it doesn't hit that teardown race.
+        Unregister-Event -SourceIdentifier PowerShell.OnIdle -ErrorAction SilentlyContinue
+        Remove-Job -Name PowerShell.OnIdle -Force -ErrorAction SilentlyContinue
+        if ($script:__starship_async_job) {
+            if ($script:__starship_async_job.State -eq 'Running') {
+                Stop-Job $script:__starship_async_job -ErrorAction SilentlyContinue
+            }
+            Receive-Job $script:__starship_async_job -ErrorAction SilentlyContinue | Out-Null
+            Remove-Job $script:__starship_async_job -Force -ErrorAction SilentlyContinue
+            $script:__starship_async_job = $null
+        }
+    }
+
+    # Register-EngineEvent's -Action scriptblock runs disconnected from
+    # module scope: neither $script:-scoped variables nor $Event.MessageData
+    # reliably resolve inside an inline anonymous action block in testing
+    # (both came back empty/null when read directly inside -Action). A
+    # scriptblock stored in a *named function* and invoked BY NAME from
+    # -Action does work, because the function itself carries the closure
+    # over module scope from where it was defined -- so the action below is
+    # just a thin `& __starship_onidle_check`, and all the real logic (and
+    # $script: state access) lives in the function, not the action block.
+    function __starship_onidle_check {
+        if (-not $script:__starship_async_job) { return }
+        # 'NotStarted' as well as 'Running' both mean "not done yet" -- a
+        # freshly created job can be observed in 'NotStarted' for one or two
+        # ticks before its worker thread actually begins, and treating that
+        # as "done" would reap/repaint on a job that never actually ran
+        # (confirmed by direct testing: a same-tick re-fire can otherwise be
+        # seen in 'NotStarted' and mishandled as complete).
+        if ($script:__starship_async_job.State -in @('NotStarted', 'Running')) {
+            # A single registration does keep recurring on its own on later
+            # idle ticks, so this re-arm is belt-and-suspenders (harmless:
+            # the null-guard above makes any duplicate firing a no-op once
+            # $script:__starship_async_job is cleared below).
+            Register-EngineEvent -SourceIdentifier PowerShell.OnIdle -SupportEvent -Action { __starship_onidle_check } | Out-Null
+            return
+        }
+        Receive-Job $script:__starship_async_job -ErrorAction SilentlyContinue | Out-Null
+        Remove-Job $script:__starship_async_job -Force -ErrorAction SilentlyContinue
+        $script:__starship_async_job = $null
+        [Microsoft.PowerShell.PSConsoleReadLine]::InvokePrompt()
+    }
+
+    function __starship_fire_async {
+        param($arguments)
+        if ($env:STARSHIP_ASYNC -eq "0") { return }
+
+        # Cancel/clean up any still-pending previous job (and its OnIdle
+        # polling registration) so rapid Enter-Enter never leaves orphaned
+        # Start-Job processes or event subscriptions behind.
+        __starship_cleanup_async
+
+        $asyncArgs = $arguments + @("--async")
+        # NOTE: the scriptblock parameter must not be named $args -- that
+        # collides with PowerShell's automatic "extra arguments" variable of
+        # the same name, which silently wins inside the job's scriptblock
+        # scope and left the splat empty (the async invocation was calling
+        # starship with zero arguments, printing usage help instead of a
+        # prompt, and never actually populating the cache).
+        #
+        # Use Start-ThreadJob when available (see $__starship_has_threadjob
+        # above for why); Start-Job still populates the cache correctly when
+        # ThreadJob is missing, we just can't observe its completion to
+        # repaint in place, so $__starship_can_repaint is already false in
+        # that case and no OnIdle handler gets registered against it.
+        $startJobCmd = if ($script:__starship_has_threadjob) { 'Start-ThreadJob' } else { 'Start-Job' }
+        $script:__starship_async_job = & $startJobCmd -ScriptBlock {
+            param($exe, $cliArgs)
+            & $exe @cliArgs | Out-Null
+        } -ArgumentList ::STARSHIP::, $asyncArgs
+
+        if ($script:__starship_can_repaint) {
+            # Repaint by re-invoking the real prompt function via the same
+            # InvokePrompt mechanism Enable-TransientPrompt already uses
+            # above, which will pick up the now-warm cache.
+            Register-EngineEvent -SourceIdentifier PowerShell.OnIdle -SupportEvent -Action { __starship_onidle_check } | Out-Null
+        }
+    }
+
+    # Clean up the background job and event subscription when the module is
+    # removed (e.g. on session exit), so nothing is left running/registered.
+    $ExecutionContext.SessionState.Module.OnRemove = {
+        __starship_cleanup_async
+    }
 
     # Invoke Starship and set continuation prompt
     Set-PSReadLineOption -ContinuationPrompt (

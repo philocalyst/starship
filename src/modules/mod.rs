@@ -113,13 +113,42 @@ mod typst;
 #[cfg(feature = "battery")]
 pub use self::battery::{BatteryInfoProvider, BatteryInfoProviderImpl};
 
+use crate::cache::{self, ExecMode};
 use crate::config::ModuleConfig;
 use crate::context::{Context, Detected, Shell};
 use crate::module::Module;
-use std::time::Instant;
+use nu_ansi_term::AnsiStrings;
+use std::time::{Duration, Instant};
+
+/// Modules that take at least this long are recorded by the async refresh, so
+/// the next fast paint can replay them instead of recomputing. Faster modules
+/// (the character, exit status, ...) are always computed live so they stay
+/// current.
+const SLOW_MODULE_THRESHOLD: Duration = Duration::from_millis(5);
+
+/// The module's fully rendered text, suitable for caching and later replay as a
+/// single pre-styled segment.
+fn module_to_string(m: &Module) -> String {
+    AnsiStrings(&m.ansi_strings()).to_string()
+}
 
 pub fn handle<'a>(module: &str, context: &'a Context) -> Option<Module<'a>> {
     let start: Instant = Instant::now();
+
+    let mode = cache::exec_mode();
+    let key = cache::module_key(module, &context.current_dir);
+
+    // Fast async paint: replay any output the last refresh recorded for this
+    // module. Only slow modules are ever recorded, so fast ones fall through
+    // and render live.
+    if mode == ExecMode::CacheRead
+        && let Some(text) = cache::read::<String>(&key)
+    {
+        let mut m = context.new_module(module);
+        m.set_segments(crate::segment::Segment::from_text(None, text));
+        return Some(m);
+    }
+
     let mut m: Option<Module> = {
         match module {
             // Keep these ordered alphabetically.
@@ -255,6 +284,17 @@ pub fn handle<'a>(module: &str, context: &'a Context) -> Option<Module<'a>> {
         // need to create an empty module just to hold the duration for that case
         m.get_or_insert_with(|| context.new_module(module)).duration = elapsed;
     }
+
+    // Record slow modules during the refresh so the next fast paint can replay
+    // them. The presence of a cache entry is itself the "this module is slow"
+    // signal, so fast modules are never served stale.
+    if mode == ExecMode::Refresh
+        && elapsed >= SLOW_MODULE_THRESHOLD
+        && let Some(m) = &m
+    {
+        cache::write(&key, &module_to_string(m));
+    }
+
     m
 }
 
@@ -385,5 +425,23 @@ mod test {
             println!("Checking if {module:?} has a description");
             assert_ne!(description(module), "<no description>");
         }
+    }
+
+    #[test]
+    fn cached_text_replays_identically() {
+        // The dispatcher caches a slow module's rendered text and later replays
+        // it as a single pre-styled segment (see `handle`). That round-trip must
+        // be byte-identical, so serving a module from the cache looks exactly
+        // like computing it.
+        use crate::segment::Segment;
+        let context = crate::test::default_context();
+
+        let mut original = context.new_module("directory");
+        original.set_segments(Segment::from_text(None, "\u{1b}[34m~/code\u{1b}[0m on "));
+        let text = module_to_string(&original);
+
+        let mut replayed = context.new_module("directory");
+        replayed.set_segments(Segment::from_text(None, text.clone()));
+        assert_eq!(module_to_string(&replayed), text);
     }
 }

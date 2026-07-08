@@ -100,3 +100,110 @@ setopt promptsubst
 PROMPT='$('::STARSHIP::' prompt --terminal-width="$COLUMNS" --keymap="${KEYMAP:-}" --status="${STARSHIP_CMD_STATUS:-}" --pipestatus="${STARSHIP_PIPE_STATUS[*]:-}" --cmd-duration="${STARSHIP_DURATION:-}" --jobs="$STARSHIP_JOBS_COUNT")'
 RPROMPT='$('::STARSHIP::' prompt --right --terminal-width="$COLUMNS" --keymap="${KEYMAP:-}" --status="${STARSHIP_CMD_STATUS:-}" --pipestatus="${STARSHIP_PIPE_STATUS[*]:-}" --cmd-duration="${STARSHIP_DURATION:-}" --jobs="$STARSHIP_JOBS_COUNT")'
 PROMPT2="$(::STARSHIP:: prompt --continuation)"
+
+# Render the left (PROMPT) and right (RPROMPT) prompts asynchronously.
+# A fast paint (CacheRead under STARSHIP_ASYNC=1) is shown immediately via
+# the instant expressions (slow modules served from cache or omitted).
+# Separate background renders are then launched (--async and --right --async)
+# and their results captured to redraw via independent zle -F callbacks.
+# This ensures RPROMPT gets its own async path and does not block or wait on
+# the left prompt (and vice versa). Opt out with STARSHIP_ASYNC=0.
+# Set STARSHIP_ASYNC_CACHE=0 to have the instant paint omit slow modules.
+: ${STARSHIP_ASYNC:=1}
+export STARSHIP_ASYNC
+
+if [[ $STARSHIP_ASYNC != 0 ]]; then
+    # Separate state for left (PROMPT) and right (RPROMPT) async jobs.
+    typeset -g \
+        _STARSHIP_ASYNC_PROMPT_FD=0 _STARSHIP_ASYNC_PROMPT_PID=0 _STARSHIP_ASYNC_PROMPT= \
+        _STARSHIP_ASYNC_RPROMPT_FD=0 _STARSHIP_ASYNC_RPROMPT_PID=0 _STARSHIP_ASYNC_RPROMPT=
+
+    # Instant (fast) paint expressions. When assigned to PROMPT/RPROMPT these
+    # cause starship to run in CacheRead mode.
+    typeset -g _STARSHIP_INSTANT_PROMPT='$('::STARSHIP::' prompt --terminal-width="$COLUMNS" --keymap="${KEYMAP:-}" --status="${STARSHIP_CMD_STATUS:-}" --pipestatus="${STARSHIP_PIPE_STATUS[*]:-}" --cmd-duration="${STARSHIP_DURATION:-}" --jobs="$STARSHIP_JOBS_COUNT")'
+    typeset -g _STARSHIP_INSTANT_RPROMPT='$('::STARSHIP::' prompt --right --terminal-width="$COLUMNS" --keymap="${KEYMAP:-}" --status="${STARSHIP_CMD_STATUS:-}" --pipestatus="${STARSHIP_PIPE_STATUS[*]:-}" --cmd-duration="${STARSHIP_DURATION:-}" --jobs="$STARSHIP_JOBS_COUNT")'
+
+    # Cancel any in-flight background render for a side. Called before
+    # starting a new one (e.g. rapid cd or prompt sequences) and on exit.
+    _starship_async_cancel_prompt() {
+        (( _STARSHIP_ASYNC_PROMPT_FD )) || return 0
+        zle -F "$_STARSHIP_ASYNC_PROMPT_FD" 2>/dev/null
+        exec {_STARSHIP_ASYNC_PROMPT_FD}<&- 2>/dev/null
+        (( _STARSHIP_ASYNC_PROMPT_PID )) && kill "$_STARSHIP_ASYNC_PROMPT_PID" 2>/dev/null
+        _STARSHIP_ASYNC_PROMPT_FD=0 _STARSHIP_ASYNC_PROMPT_PID=0
+    }
+
+    _starship_async_cancel_rprompt() {
+        (( _STARSHIP_ASYNC_RPROMPT_FD )) || return 0
+        zle -F "$_STARSHIP_ASYNC_RPROMPT_FD" 2>/dev/null
+        exec {_STARSHIP_ASYNC_RPROMPT_FD}<&- 2>/dev/null
+        (( _STARSHIP_ASYNC_RPROMPT_PID )) && kill "$_STARSHIP_ASYNC_RPROMPT_PID" 2>/dev/null
+        _STARSHIP_ASYNC_RPROMPT_FD=0 _STARSHIP_ASYNC_RPROMPT_PID=0
+    }
+
+    _starship_async_cancel() {
+        _starship_async_cancel_prompt
+        _starship_async_cancel_rprompt
+    }
+
+    # ZLE callback for the left prompt async result.
+    _starship_async_callback() {
+        local fd=$1
+        # Slurp the rendered prompt (possibly multi-line) up to EOF.
+        IFS= read -rd '' -u "$fd" _STARSHIP_ASYNC_PROMPT 2>/dev/null
+        zle -F "$fd" 2>/dev/null
+        exec {fd}<&- 2>/dev/null
+        _STARSHIP_ASYNC_PROMPT_FD=0 _STARSHIP_ASYNC_PROMPT_PID=0
+        # Assign literally (single quotes) so any embedded $ etc. are not re-expanded.
+        PROMPT='${_STARSHIP_ASYNC_PROMPT}'
+        zle reset-prompt
+    }
+
+    # Separate ZLE callback for the right prompt async result.
+    _starship_async_callback_rprompt() {
+        local fd=$1
+        IFS= read -rd '' -u "$fd" _STARSHIP_ASYNC_RPROMPT 2>/dev/null
+        zle -F "$fd" 2>/dev/null
+        exec {fd}<&- 2>/dev/null
+        _STARSHIP_ASYNC_RPROMPT_FD=0 _STARSHIP_ASYNC_RPROMPT_PID=0
+        RPROMPT='${_STARSHIP_ASYNC_RPROMPT}'
+        zle reset-prompt
+    }
+
+    # precmd: install instant paints, launch (or relaunch) the two independent
+    # background renders.
+    _starship_async_refresh() {
+        _starship_async_cancel
+        PROMPT=$_STARSHIP_INSTANT_PROMPT
+        RPROMPT=$_STARSHIP_INSTANT_RPROMPT
+
+        exec {_STARSHIP_ASYNC_PROMPT_FD}< <(::STARSHIP:: prompt --async \
+            --terminal-width="$COLUMNS" \
+            --keymap="${KEYMAP:-}" \
+            --status="${STARSHIP_CMD_STATUS:-}" \
+            --pipestatus="${STARSHIP_PIPE_STATUS[*]:-}" \
+            --cmd-duration="${STARSHIP_DURATION:-}" \
+            --jobs="$STARSHIP_JOBS_COUNT")
+        _STARSHIP_ASYNC_PROMPT_PID=$!
+        zle -F "$_STARSHIP_ASYNC_PROMPT_FD" _starship_async_callback
+
+        exec {_STARSHIP_ASYNC_RPROMPT_FD}< <(::STARSHIP:: prompt --right --async \
+            --terminal-width="$COLUMNS" \
+            --keymap="${KEYMAP:-}" \
+            --status="${STARSHIP_CMD_STATUS:-}" \
+            --pipestatus="${STARSHIP_PIPE_STATUS[*]:-}" \
+            --cmd-duration="${STARSHIP_DURATION:-}" \
+            --jobs="$STARSHIP_JOBS_COUNT")
+        _STARSHIP_ASYNC_RPROMPT_PID=$!
+        zle -F "$_STARSHIP_ASYNC_RPROMPT_FD" _starship_async_callback_rprompt
+    }
+
+    add-zsh-hook precmd _starship_async_refresh
+
+    # Cleanup on exit: kill any still-running async jobs and close their fds.
+    _starship_async_cleanup() {
+        _starship_async_cancel
+    }
+    add-zsh-hook zshexit _starship_async_cleanup
+fi
+

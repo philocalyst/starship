@@ -133,6 +133,10 @@ enum Commands {
         /// Print the continuation prompt (instead of the standard left prompt)
         #[clap(long, conflicts_with = "right", conflicts_with = "profile")]
         continuation: bool,
+        /// Render slow modules in the background and record them, so the shell
+        /// can redraw the prompt with them once ready (used for async prompts)
+        #[clap(long = "async")]
+        async_refresh: bool,
         #[clap(flatten)]
         properties: Properties,
     },
@@ -229,7 +233,9 @@ fn main() {
             right,
             profile,
             continuation,
+            async_refresh,
         } => {
+            configure_async_prompt(async_refresh);
             let target = match (right, profile, continuation) {
                 (true, _, _) => Target::Right,
                 (_, Some(profile_name), _) => Target::Profile(profile_name),
@@ -312,6 +318,33 @@ fn main() {
         }
         #[cfg(feature = "config-schema")]
         Commands::ConfigSchema => print::print_schema(),
+    }
+}
+
+/// Select the execution mode for this prompt render.
+///
+/// Async prompting is enabled by the shell (see the `init` scripts) via the
+/// `STARSHIP_ASYNC` environment variable. When it is set, a plain
+/// `starship prompt` is the fast paint that serves slow work from the cache,
+/// and `starship prompt --async` is the background refresh that recomputes and
+/// records it (its output is captured by the shell to redraw). When unset,
+/// every prompt renders directly, exactly as before.
+fn configure_async_prompt(async_refresh: bool) {
+    use starship::cache::{self, ExecMode};
+
+    let async_enabled =
+        std::env::var_os("STARSHIP_ASYNC").is_some_and(|v| v != "0" && !v.is_empty());
+    let mode = match (async_enabled, async_refresh) {
+        (true, true) => ExecMode::Refresh,
+        (true, false) => ExecMode::CacheRead,
+        (false, _) => ExecMode::Direct,
+    };
+    cache::set_exec_mode(mode);
+
+    // Prune stale entries from abandoned directories as the refresh writes new
+    // ones, like log cleanup.
+    if mode == ExecMode::Refresh && cache::cache_enabled() {
+        rayon::spawn(cache::cleanup);
     }
 }
 

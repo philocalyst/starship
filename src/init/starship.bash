@@ -77,9 +77,39 @@ starship_precmd() {
         ARGS+=( --cmd-duration="${STARSHIP_DURATION}")
         STARSHIP_START_TIME=""
     fi
-    PS1="$(::STARSHIP:: prompt "${ARGS[@]}")"
+
+    # Async support: always compute the "instant" (CacheRead under STARSHIP_ASYNC=1)
+    # prompt first for responsiveness. If async is on, set PS1 to a getter that
+    # adopts the full result once it lands, and launch the --async refresh in
+    # the background (atomic write) to populate the cache for it.
+    #
+    # Note for plain Bash: there is no portable way to force readline to
+    # re-expand PS1 mid-line, so the refreshed prompt is only picked up on the
+    # *next* prompt draw (i.e. after the next command), not while the current
+    # line is being edited. We still signal WINCH because ble.sh (if attached)
+    # has its own redraw path that can act on it; in plain Bash it is a no-op
+    # beyond bookkeeping ($COLUMNS/$LINES via `checkwinsize`).
+    local prompt
+    prompt="$(::STARSHIP:: prompt "${ARGS[@]}")"
+    if [[ ${STARSHIP_ASYNC:-0} != 0 ]]; then
+        _starship_async_cancel
+        _STARSHIP_INSTANT_PROMPT=${prompt}
+        _STARSHIP_ASYNC_PROMPT=
+        PS1='$(_starship_get_prompt)'
+        local tmp
+        tmp=$(mktemp -t "starship-async.$$.XXXXXX" 2>/dev/null || echo "/tmp/starship-async.$$.$RANDOM")
+        _STARSHIP_ASYNC_TMP=${tmp}
+        (
+            ::STARSHIP:: prompt --async "${ARGS[@]}" >"${tmp}.tmp" && mv -f "${tmp}.tmp" "${tmp}"
+            kill -WINCH $$ 2>/dev/null || true
+        ) &
+        _STARSHIP_ASYNC_PID=$!
+        disown "${_STARSHIP_ASYNC_PID}" 2>/dev/null || true
+    else
+        PS1=${prompt}
+    fi
     if [[ ${BLE_ATTACHED-} ]]; then
-        local nlns=${PS1//[!$'\n']}
+        local nlns=${prompt//[!$'\n']}
         bleopt prompt_rps1="$nlns$(::STARSHIP:: prompt --right "${ARGS[@]}")"
     fi
     STARSHIP_PREEXEC_READY=true  # Signal that we can safely restart the timer
@@ -143,6 +173,11 @@ shopt -s checkwinsize
 STARSHIP_START_TIME=$(::STARSHIP:: time)
 export STARSHIP_SHELL="bash"
 
+# Enable async prompt support by default. A plain `starship prompt` becomes the
+# instant (CacheRead) paint; `starship prompt --async` is the background refresh.
+: ${STARSHIP_ASYNC:=1}
+export STARSHIP_ASYNC
+
 # Set up the session key that will be used to store logs
 STARSHIP_SESSION_KEY="$RANDOM$RANDOM$RANDOM$RANDOM$RANDOM"; # Random generates a number b/w 0 - 32767
 STARSHIP_SESSION_KEY="${STARSHIP_SESSION_KEY}0000000000000000" # Pad it to 16+ chars.
@@ -150,4 +185,78 @@ export STARSHIP_SESSION_KEY=${STARSHIP_SESSION_KEY:0:16}; # Trim to 16-digits if
 
 # Set the continuation prompt
 PS2="$(::STARSHIP:: prompt --continuation)"
+
+# Async repainting support for Bash using STARSHIP_ASYNC and --async.
+# - STARSHIP_ASYNC=1 (default) makes plain `prompt` a fast CacheRead paint.
+# - We launch `prompt --async` (Refresh) in the background to populate the
+#   cache and hand back the full prompt text.
+# Full integration: starship_precmd (used by PROMPT_COMMAND, the ble.sh
+# PRECMD hook, and bash-preexec precmd_functions) handles launch/cancel.
+# Correctness:
+# - Repaint: the background job writes atomically then sends SIGWINCH. Plain
+#   Bash has no way to force readline to re-expand PS1 mid-line, so this only
+#   makes the refreshed prompt visible starting with the *next* prompt draw
+#   (see _starship_get_prompt); ble.sh, if attached, can act on WINCH sooner.
+# - Job counting: launched after NUM_JOBS calc; disown prevents it from
+#   appearing in `jobs` for subsequent counts (combined with the jobs
+#   &>/dev/null workaround already present).
+# - Cancellation: _starship_async_cancel kills the whole process group we
+#   launched (the background job forks the actual `starship` child, so
+#   killing just the job's own pid would leak it) and removes any tmp file
+#   before the next launch (handles rapid prompts, ble hooks, etc.).
+if [[ ${STARSHIP_ASYNC:-0} != 0 ]]; then
+    _STARSHIP_ASYNC_PID=0
+    _STARSHIP_ASYNC_TMP=
+    _STARSHIP_INSTANT_PROMPT=
+    _STARSHIP_ASYNC_PROMPT=
+
+    _starship_async_cancel() {
+        if [[ -n ${_STARSHIP_ASYNC_PID} ]] && [[ ${_STARSHIP_ASYNC_PID} != 0 ]] && kill -0 "${_STARSHIP_ASYNC_PID}" 2>/dev/null; then
+            # The backgrounded job is its own process group leader (Bash job
+            # control), so -PID kills it and the `starship --async` child it
+            # forked. Fall back to killing just the job if that fails (e.g.
+            # job control unavailable), so we never leak the wrapper either.
+            kill -- "-${_STARSHIP_ASYNC_PID}" 2>/dev/null || true
+            kill "${_STARSHIP_ASYNC_PID}" 2>/dev/null || true
+        fi
+        _STARSHIP_ASYNC_PID=0
+        if [[ -n ${_STARSHIP_ASYNC_TMP} ]]; then
+            rm -f "${_STARSHIP_ASYNC_TMP}" "${_STARSHIP_ASYNC_TMP}.tmp" 2>/dev/null || true
+            _STARSHIP_ASYNC_TMP=
+        fi
+    }
+
+    # Make sure a still-running refresh and its tmp file don't outlive the
+    # shell. Layer onto any existing EXIT trap instead of clobbering it.
+    eval "STARSHIP_EXIT_TRAP=($(trap -p EXIT))"
+    STARSHIP_EXIT_TRAP=("${STARSHIP_EXIT_TRAP[2]}")
+    if [[ -z "$STARSHIP_EXIT_TRAP" ]]; then
+        trap '_starship_async_cancel' EXIT
+    elif [[ "$STARSHIP_EXIT_TRAP" != *"_starship_async_cancel"* ]]; then
+        trap "${STARSHIP_EXIT_TRAP}"$'\n''_starship_async_cancel' EXIT
+    fi
+
+    _starship_get_prompt() {
+        # If a refresh completed (pid gone and file present from mv), adopt it.
+        if [[ -n ${_STARSHIP_ASYNC_TMP} && -f ${_STARSHIP_ASYNC_TMP} ]] && ! kill -0 "${_STARSHIP_ASYNC_PID}" 2>/dev/null; then
+            _STARSHIP_ASYNC_PROMPT=$(cat -- "${_STARSHIP_ASYNC_TMP}")
+            PS1=${_STARSHIP_ASYNC_PROMPT}
+            rm -f "${_STARSHIP_ASYNC_TMP}" 2>/dev/null || true
+            _STARSHIP_ASYNC_TMP=
+            _STARSHIP_ASYNC_PID=0
+            if [[ ${BLE_ATTACHED-} ]]; then
+                # ble.sh: update its prompt structures and force repaint for async result
+                bleopt prompt_ps1="${_STARSHIP_ASYNC_PROMPT}" 2>/dev/null || true
+                ble/prompt/update 2>/dev/null || true
+            fi
+            printf %s "${_STARSHIP_ASYNC_PROMPT}"
+            return
+        fi
+        if [[ -n ${_STARSHIP_ASYNC_PROMPT} ]]; then
+            printf %s "${_STARSHIP_ASYNC_PROMPT}"
+        else
+            printf %s "${_STARSHIP_INSTANT_PROMPT}"
+        fi
+    }
+fi
 

@@ -10,6 +10,57 @@ function __starship_set_job_count --description 'Set STARSHIP_JOBS using fish jo
     end    
 end
 
+function __starship_fire_async --argument-names cmd_status cmd_pipestatus keymap duration jobs
+    # Fire a background `starship prompt --async` (Refresh) using the provided
+    # context. Its stdout is discarded; it exists to (re)populate the cache.
+    # We also fire one for --right so that fish_right_prompt benefits.
+    # After both complete we twiddle a universal var; the --on-variable handler
+    # then does `commandline -f repaint` so the next prompt draw (via CacheRead)
+    # will see fresh cached values.
+    #
+    # The ready variable is scoped by this session's PID ($fish_pid, captured
+    # in $__starship_async_ready_var below). Universal variables are shared by
+    # every fish process on the machine, so an unscoped name would make one
+    # session's completed refresh trigger repaints (and eventually erasure
+    # events) in every other unrelated fish session/tab.
+    # Kill any previous bg refresh (for rapid successive prompts).
+    __starship_kill_async
+    env \
+        COLUMNS="$COLUMNS" \
+        STARSHIP_CMD_STATUS="$cmd_status" \
+        STARSHIP_CMD_PIPESTATUS="$cmd_pipestatus" \
+        STARSHIP_KEYMAP="$keymap" \
+        STARSHIP_DURATION="$duration" \
+        STARSHIP_JOBS="$jobs" \
+        STARSHIP_ASYNC_READY_VAR="$__starship_async_ready_var" \
+        fish -c '
+            ::STARSHIP:: prompt --async \
+                --terminal-width="$COLUMNS" \
+                --status="$STARSHIP_CMD_STATUS" \
+                --pipestatus="$STARSHIP_CMD_PIPESTATUS" \
+                --keymap="$STARSHIP_KEYMAP" \
+                --cmd-duration="$STARSHIP_DURATION" \
+                --jobs="$STARSHIP_JOBS" >/dev/null 2>&1
+            ::STARSHIP:: prompt --right --async \
+                --terminal-width="$COLUMNS" \
+                --status="$STARSHIP_CMD_STATUS" \
+                --pipestatus="$STARSHIP_CMD_PIPESTATUS" \
+                --keymap="$STARSHIP_KEYMAP" \
+                --cmd-duration="$STARSHIP_DURATION" \
+                --jobs="$STARSHIP_JOBS" >/dev/null 2>&1
+            set -U $STARSHIP_ASYNC_READY_VAR (random)(random)
+        ' &
+    set -g __starship_async_pid $last_pid
+    disown $last_pid 2>/dev/null
+end
+
+function __starship_kill_async
+    if set -q __starship_async_pid
+        kill $__starship_async_pid 2>/dev/null
+        set -e __starship_async_pid
+    end
+end
+
 function fish_prompt
     switch "$fish_key_bindings"
         case fish_hybrid_key_bindings fish_vi_key_bindings fish_helix_key_bindings
@@ -39,6 +90,13 @@ function fish_prompt
         end
     else
         ::STARSHIP:: prompt --terminal-width="$COLUMNS" --status=$STARSHIP_CMD_STATUS --pipestatus="$STARSHIP_CMD_PIPESTATUS" --keymap=$STARSHIP_KEYMAP --cmd-duration=$STARSHIP_DURATION --jobs=$STARSHIP_JOBS
+        if test "$STARSHIP_ASYNC" != "0"
+            if test "$__starship_async_skip_fire" = "1"
+                set -g __starship_async_skip_fire 0
+            else
+                __starship_fire_async $STARSHIP_CMD_STATUS "$STARSHIP_CMD_PIPESTATUS" $STARSHIP_KEYMAP "$STARSHIP_DURATION" "$STARSHIP_JOBS"
+            end
+        end
     end
 end
 
@@ -67,6 +125,14 @@ function fish_right_prompt
         end
     else
         ::STARSHIP:: prompt --right --terminal-width="$COLUMNS" --status=$STARSHIP_CMD_STATUS --pipestatus="$STARSHIP_CMD_PIPESTATUS" --keymap=$STARSHIP_KEYMAP --cmd-duration=$STARSHIP_DURATION --jobs=$STARSHIP_JOBS
+        # Participate in async state (skip_fire) so fish_right_prompt is fully
+        # integrated with the async sketch (clear on repaint render). Firing
+        # (incl. right async) stays in left for single launch per cycle.
+        if test "$STARSHIP_ASYNC" != "0"
+            if test "$__starship_async_skip_fire" = "1"
+                set -g __starship_async_skip_fire 0
+            end
+        end
     end
 end
 
@@ -78,16 +144,35 @@ builtin functions -e fish_mode_prompt
 
 set -gx STARSHIP_SHELL "fish"
 
+# Default to async prompt support (opt-out: set STARSHIP_ASYNC=0).
+set -q STARSHIP_ASYNC; or set -gx STARSHIP_ASYNC 1
+set -gx STARSHIP_ASYNC $STARSHIP_ASYNC
+
 # Transience related functions
 function __starship_reset_transient --on-event fish_postexec
     set -g TRANSIENT 0
     set -g RIGHT_TRANSIENT 0
+    # Reset async skip so the following normal prompt (left or right) will fire
+    # the bg refresh (covering fish_right_prompt async too). Prevents transients
+    # from leaving stale skip_fire that would suppress async after the cmd.
+    if test "$STARSHIP_ASYNC" != "0"
+        set -g __starship_async_skip_fire 0
+    end
 end
 
 function __starship_transient_execute
     if commandline --is-valid || test -z (commandline | string collect) && not commandline --paging-mode
         set -g TRANSIENT 1
         set -g RIGHT_TRANSIENT 1
+        # Protect async state: clear skip and kill pending refresh so a transient
+        # repaint/execute does not race or leave skip=1 that would disable async
+        # for the command that follows.
+        if test "$STARSHIP_ASYNC" != "0"
+            set -g __starship_async_skip_fire 0
+            if functions -q __starship_kill_async
+                __starship_kill_async
+            end
+        end
         commandline -f repaint
     end
     commandline -f execute
@@ -139,6 +224,44 @@ function disable_transience --description 'remove transient prompt keybindings'
     end
     bind --user -e \r
     bind --user -M insert -e \r
+end
+
+if test "$STARSHIP_ASYNC" != "0"
+    set -g __starship_async_skip_fire 0
+
+    # Universal variables are broadcast to every fish process on the machine,
+    # not just this session, so the "async refresh finished" signal is scoped
+    # to a per-session variable name (using this shell's PID, which is stable
+    # and unique for its lifetime). This keeps unrelated fish sessions/tabs
+    # from repainting (or firing the erasure event on exit, see cleanup below)
+    # when this session's background refresh completes.
+    # $fish_pid replaced the older %self process expansion in fish 4.0; fall
+    # back to %self on older fish so this still works pre-4.0.
+    if __starship_fish_version_at_least 4.0
+        set -g __starship_async_ready_var "__starship_async_ready_$fish_pid"
+    else
+        set -g __starship_async_ready_var "__starship_async_ready_"%self
+    end
+
+    function __starship_async_repaint --on-variable $__starship_async_ready_var
+        # A background refresh finished; repaint so fish_prompt / fish_right_prompt
+        # re-run and pick up updated values via (fast) plain prompt CacheRead.
+        # Transient bypass: do not repaint if a transient is active.
+        if test "$TRANSIENT" = "1"; or test "$RIGHT_TRANSIENT" = "1"
+            return
+        end
+        set -g __starship_async_skip_fire 1
+        commandline -f repaint
+    end
+
+    # Cleanup on exit to avoid leaking uvars or pending jobs. Erase this
+    # session's own ready var only -- never touch other sessions' entries.
+    function __starship_async_cleanup --on-event fish_exit
+        if functions -q __starship_kill_async
+            __starship_kill_async
+        end
+        set -e $__starship_async_ready_var 2>/dev/null
+    end
 end
 
 # Set up the session key that will be used to store logs

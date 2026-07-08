@@ -118,6 +118,7 @@ dunce = "1.0.5"
 winres = "0.1.12"
 
 [dev-dependencies]
+alacritty_terminal = "0.26.0"
 mockall = "=0.15.0"
 
 [profile.release]
