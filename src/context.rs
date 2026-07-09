@@ -961,7 +961,7 @@ pub enum Target {
 }
 
 /// Properties as passed on from the shell as arguments
-#[derive(Parser, Debug)]
+#[derive(Parser, Clone, Debug)]
 pub struct Properties {
     /// The status code of the previously run command as an unsigned or signed 32bit integer
     #[clap(short = 's', long = "status")]

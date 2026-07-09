@@ -4,10 +4,11 @@
 //! asserts the async-prompt contract end to end:
 //!
 //!   1. The very first prompt paints synchronously and is not empty.
-//!   2. Once the cache is warm, the `on_pre_prompt` background worker
-//!      refreshes `_STARSHIP_LEFT`/`_STARSHIP_RIGHT` via `--async` and
-//!      `app.invalidate()` fires, and the content actually changes (proven
-//!      via a unique per-render marker).
+//!   2. Once the cache is warm, the `on_pre_prompt`-launched watcher
+//!      (`starship prompt --deferred --watch`) pokes its reader thread, which
+//!      republishes `_STARSHIP_LEFT`/`_STARSHIP_RIGHT` via `--cached` paints
+//!      and `app.invalidate()` fires, and the content actually changes
+//!      (proven via a unique per-render marker).
 //!   3. `on_pre_prompt` fires once per logical prompt line -- NOT once per
 //!      resize.
 //!   4. `STARSHIP_ASYNC=0` fully disables the async machinery: no hook
@@ -335,7 +336,7 @@ fn first_paint_is_synchronous_and_nonempty() {
 res = {}
 res['initial_left'] = _STARSHIP_LEFT
 res['initial_right'] = _STARSHIP_RIGHT
-res['async_enabled'] = _STARSHIP_ASYNC_ENABLED
+res['async_enabled'] = _STARSHIP_ASYNC
 print('INITIAL:' + json.dumps(res))
 t0 = time.time()
 p1 = starship_prompt()
@@ -381,7 +382,7 @@ print('FIRST_PROMPT_CALL:' + json.dumps({'value': p1, 'elapsed_ms': (t1 - t0) * 
 
 // ============================================================================
 // CHECK 2: once the cache is warm, the on_pre_prompt background worker
-// refreshes _STARSHIP_LEFT/_STARSHIP_RIGHT via --async and app.invalidate()
+// republishes _STARSHIP_LEFT/_STARSHIP_RIGHT off the watcher poke and app.invalidate()
 // fires, and the content actually changes (proven via a unique per-render
 // marker: the microsecond `$time` module output).
 // ============================================================================
@@ -394,20 +395,13 @@ fn background_refresh_invalidates_and_updates_content() {
 
     // Split across two separately-submitted commands (probe_a, then probe_b
     // after a real pause) rather than one command that calls `time.sleep()`
-    // itself to "wait for the background refresh": xonsh's subprocess-running
-    // machinery (`__xonsh__.subproc_captured_stdout`, used by
-    // `_starship_refresh`) is not safe to run concurrently from a background
-    // thread while the *foreground* interpreter thread is itself blocked
-    // inside a Python `time.sleep()` call mid-exec -- confirmed by direct
-    // experimentation (an isolated probe hangs forever at exactly this point:
-    // state reads fine up to and including 50ms into the sleep, then the
-    // session never produces another byte of output, not even much later).
-    // This doesn't come up in real interactive use because the *real* main
-    // thread is sitting idle in prompt_toolkit's own event loop between
-    // commands, not blocked inside an exec'd sleep -- so waiting for the real
-    // 2 real-world seconds from the Rust driver side instead (between two
-    // separate, quickly-returning commands) exercises the same
-    // background-refresh behavior without the artificial deadlock.
+    // itself to "wait for the background refresh": in real interactive use
+    // the main thread sits idle in prompt_toolkit's own event loop between
+    // commands, not blocked inside an exec'd sleep, so waiting the real
+    // 2 real-world seconds from the Rust driver side (between two separate,
+    // quickly-returning commands) matches actual usage -- and historically a
+    // foreground `time.sleep()` deadlocked xonsh's subprocess machinery
+    // against the background thread's starship invocations.
     let probe_a = r#"import json
 app = __xonsh__.shell.shell.prompter.app
 _orig_invalidate = app.invalidate
@@ -574,7 +568,7 @@ fn disabled_async_flag_is_respected() {
         &mut session,
         r#"import json
 res = {}
-res['async_enabled_flag'] = _STARSHIP_ASYNC_ENABLED
+res['async_enabled_flag'] = _STARSHIP_ASYNC
 res['starship_async_env'] = $STARSHIP_ASYNC
 res['hook_registered'] = _starship_on_pre_prompt in list(events.on_pre_prompt)
 res['initial_left'] = _STARSHIP_LEFT
@@ -697,9 +691,9 @@ fn abrupt_kill_mid_refresh_leaves_no_zombies_or_corrupt_cache() {
     let xonsh_pid = session.pid();
 
     session.send("print('READY:true')\n_starship_on_pre_prompt()\r");
-    // Give the background thread just enough time to spawn the `starship
-    // --async` subprocess (which itself sleeps 0.2s in the slow module) but
-    // kill well before it can finish and write cache.
+    // Give on_pre_prompt just enough time to spawn the `starship prompt
+    // --deferred --watch` watcher (which itself sleeps 0.2s in the slow
+    // module) but kill well before it can finish and write cache.
     session.pump(Duration::from_millis(80));
     session.kill();
     std::thread::sleep(Duration::from_millis(500));
@@ -709,7 +703,7 @@ fn abrupt_kill_mid_refresh_leaves_no_zombies_or_corrupt_cache() {
     // match on the binary's command name: the other checks in this same file
     // now run concurrently (each `#[test]` fn is its own thread under the
     // default multi-threaded runner) and legitimately have their own
-    // in-flight `starship --async` refreshes at any given moment, which a
+    // in-flight `starship --deferred` refreshes at any given moment, which a
     // bare "any process named .../target/debug/starship" scan would
     // misattribute as leaks from this check.
     let ps_out = Command::new("ps")

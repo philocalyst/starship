@@ -1,41 +1,18 @@
 //! Automated, self-contained regression tests for the async prompt
-//! integration in `src/init/starship.ps1`. Drives a real interactive pwsh
-//! (over a real pty via the shared harness, which -- unlike the old Python
-//! pty driver this replaces -- answers cursor-position-report queries
-//! through genuine `alacritty_terminal` terminal emulation) against the
-//! real built starship binary, and asserts the end-to-end async behavior
-//! documented in that file.
+//! integration in `src/init/starship.ps1`. Drives a real pwsh -- both
+//! non-interactively (`-File`) and interactively over a real pty via the
+//! shared harness -- against the real built starship binary.
 //!
-//! Ported from `tests/init-async/test_ps1.sh`. See that file's header for
-//! the full history of how each check reached its current shape; the two
-//! points that matter most for maintaining this port:
-//!
-//!   * Check 3 (OnIdle-driven in-place repaint) is ADVISORY, not a hard
-//!     failure: PowerShell.OnIdle is confirmed (by direct experimentation,
-//!     and by upstream PSReadLine/PSReadLine#1092) to stop firing for the
-//!     rest of the session on this platform once the background job spawns
-//!     a real child process. This is a platform/runtime limitation, not a
-//!     bug in starship.ps1 (see the comments next to
-//!     `$script:__starship_can_repaint` there) -- so these tests warn
-//!     rather than fail when the marker never lands.
-//!   * Check 4 (leaked jobs/subscriptions) asserts "bounded across rapid
-//!     cycling" (never grows with iteration count) and "exactly zero only
-//!     after an explicit session exit" (Remove-Module -> OnRemove ->
-//!     __starship_cleanup_async) -- NOT "exactly zero immediately after
-//!     cycling", since a completed job/subscription legitimately isn't
-//!     reaped until the *next* __starship_fire_async call or session exit.
-//!     `Get-EventSubscriber` needs `-Force` to see `-SupportEvent`
-//!     subscriptions at all, or every count silently reads 0.
-//!   * check4c (Get-Job reaches zero after session exit) is ALSO advisory,
-//!     for the same reason as check 3: independently confirmed, via an
-//!     isolated repro with zero starship.ps1 code, that
-//!     `$ExecutionContext.SessionState.Module.OnRemove` never fires at all
-//!     on `Remove-Module` on this pwsh 7.7.0-preview.2 build -- a second,
-//!     distinct platform limitation alongside the OnIdle one, not a bug in
-//!     starship.ps1's (correct) OnRemove registration. check4d (event
-//!     subscribers) is unaffected and stays a hard assertion: subscriptions
-//!     are torn down on runspace/module-scope exit through a different path
-//!     that doesn't depend on OnRemove firing.
+//! The PowerShell model under test is deliberately minimal: the prompt
+//! function paints with `--cached` and fires one fire-and-forget
+//! `starship prompt --deferred` via `Invoke-Native -NoWait` (a bare
+//! `System.Diagnostics.Process`, no PowerShell jobs, no OnIdle event
+//! machinery -- both were confirmed unable to repaint in place on this
+//! platform, so the refreshed values simply appear on the next prompt
+//! draw). The checks therefore assert: warm `--cached` paints are fast and
+//! show the recorded value, the fire-and-forget refresh populates the
+//! cache, nothing ever lands in `Get-Job`/`Get-EventSubscriber`, and
+//! `STARSHIP_ASYNC=0` reproduces the classic synchronous path.
 //!
 //! Locates `pwsh` on `$PATH`, falling back to the known preview-cask
 //! install location if absent.
@@ -170,20 +147,6 @@ fn count_files_recursive(dir: &Path) -> usize {
     count
 }
 
-/// Print a clearly labeled WARN-style message for an advisory (confirmed
-/// platform-limited, not a starship.ps1 bug) outcome instead of failing the
-/// test -- see module docs for check 3 and check4c, the two checks this is
-/// used for. Unlike `assert!`, this never panics: the test function always
-/// returns normally, but the outcome is still unmistakable in
-/// `--nocapture` output.
-fn warn_check(passed: bool, name: &str, detail: impl std::fmt::Display) {
-    if passed {
-        println!("PASS: {name}");
-    } else {
-        println!("WARN: {name}: {detail}");
-    }
-}
-
 /// A scratch PowerShell environment: an isolated scratch dir with a real
 /// `starship.toml` (fast + slow custom modules, see [`render_ps1_config`]),
 /// an isolated `STARSHIP_CACHE`, a real `pwsh` binary location, and the real
@@ -198,13 +161,11 @@ fn warn_check(passed: bool, name: &str, detail: impl std::fmt::Display) {
 ///     directly (timing, leak-counting, the ASYNC=0 check).
 ///   * [`Self::spawn_interactive`] drives a real interactive pwsh over a
 ///     real pty via [`PtySession`], for checks that need genuine
-///     interactive behavior (the cache-population and OnIdle/repaint
-///     checks).
+///     interactive behavior (the cache-population check).
 struct Ps1Env {
     root: tempfile::TempDir,
     config_path: PathBuf,
     init_path: PathBuf,
-    init_content: String,
 }
 
 impl Ps1Env {
@@ -227,7 +188,6 @@ impl Ps1Env {
             root,
             config_path,
             init_path,
-            init_content,
         }
     }
 
@@ -373,12 +333,12 @@ Write-Host "TIMING_HAS_SLOW=$($r -match 'SLOW-')"
     );
 }
 
-/// CHECK 2: `__starship_fire_async` launches a background job whose
-/// completion populates the on-disk cache. Needs a real interactive session
-/// (not just `-File`), since it's driven by the real precmd-equivalent
-/// startup path.
+/// CHECK 2: a real interactive prompt draw fires the fire-and-forget
+/// `--deferred` refresh, which populates the on-disk cache. Needs a real
+/// interactive session (not just `-File`), since it's driven by the real
+/// `global:prompt` function PowerShell itself invokes on each draw.
 #[test]
-fn check2_background_job_populates_cache() {
+fn check2_background_refresh_populates_cache() {
     let env = Ps1Env::new();
     let cache = env.fresh_cache("cache_populate");
 
@@ -388,91 +348,68 @@ fn check2_background_job_populates_cache() {
     let cache_files_after = count_files_recursive(&cache);
     assert!(
         cache_files_after > 0,
-        "check2: background --async job should populate the on-disk cache; found {cache_files_after} \
-         file(s) under {}",
+        "check2: the fire-and-forget --deferred refresh should populate the on-disk cache; found \
+         {cache_files_after} file(s) under {}",
         cache.display()
     );
 }
 
-/// CHECK 3: the PowerShell.OnIdle completion handler genuinely fires
-/// InvokePrompt on job completion -- proven by a marker written immediately
-/// before the real InvokePrompt() call inside the handler, and separately by
-/// the visible prompt content changing in place (two distinct SLOW-<ts>
-/// markers in one session without an extra Enter).
-///
-/// ADVISORY, not a hard failure: see module docs -- OnIdle is confirmed to
-/// stop firing on this platform once the background job spawns a real child
-/// process, a platform/runtime limitation rather than a starship.ps1 bug.
-/// Both sub-checks here warn rather than assert/panic.
+/// CHECK 3: the model deliberately uses no PowerShell job or event-
+/// subscription machinery -- `Invoke-Native -NoWait` is a bare
+/// `System.Diagnostics.Process`, so `Get-Job`/`Get-EventSubscriber` must stay
+/// at zero even after several prompt draws (each firing its own
+/// fire-and-forget refresh).
 #[test]
-fn check3_onidle_repaint_advisory() {
+fn check3_no_job_or_event_subscription_machinery() {
     let env = Ps1Env::new();
+    let cache = env.fresh_cache("cache_no_jobs");
 
-    let marker_file = env.path().join("invokeprompt.marker");
-    fs::remove_file(&marker_file).ok();
+    let log = env.run_file(
+        "no_jobs_check.ps1",
+        &cache,
+        r#"$env:STARSHIP_CONFIG = '{config}'
+$env:STARSHIP_CACHE = '{cache}'
+$env:STARSHIP_ASYNC = '1'
+Set-Location '{root}'
+Import-Module PSReadLine -ErrorAction SilentlyContinue
+. '{init}'
 
-    let target = "        Receive-Job $script:__starship_async_job -ErrorAction SilentlyContinue | Out-Null\n        Remove-Job $script:__starship_async_job -Force -ErrorAction SilentlyContinue\n        $script:__starship_async_job = $null\n        [Microsoft.PowerShell.PSConsoleReadLine]::InvokePrompt()";
-    let patch_ok = env.init_content.contains(target);
-    let init_marked_path = env.path().join("starship_init_marked.ps1");
-    if patch_ok {
-        let replacement = format!(
-            "        Receive-Job $script:__starship_async_job -ErrorAction SilentlyContinue | Out-Null\n        Remove-Job $script:__starship_async_job -Force -ErrorAction SilentlyContinue\n        $script:__starship_async_job = $null\n        Add-Content -Path '{}' -Value 'INVOKEPROMPT_CALLED'\n        [Microsoft.PowerShell.PSConsoleReadLine]::InvokePrompt()",
-            marker_file.display()
-        );
-        let marked = env.init_content.replacen(target, &replacement, 1);
-        fs::write(&init_marked_path, marked).unwrap();
-    } else {
-        fs::write(&init_marked_path, &env.init_content).unwrap();
-    }
-    // Locating the injection site is a hard precondition for this check to
-    // mean anything at all -- if starship.ps1's implementation shape has
-    // changed, that's worth failing loudly on rather than silently reporting
-    // an unrelated WARN below.
-    assert!(
-        patch_ok,
-        "check3a: could not locate the InvokePrompt call site in starship.ps1 to inject a \
-         verification marker -- implementation may have changed shape"
+for ($i = 0; $i -lt 5; $i++) {{
+    $null = prompt
+    Start-Sleep -Milliseconds 100
+}}
+$jc = (Get-Job -ErrorAction SilentlyContinue | Measure-Object).Count
+$sc = (Get-EventSubscriber -Force -ErrorAction SilentlyContinue | Measure-Object).Count
+Write-Host "JOB_COUNT=$jc"
+Write-Host "SUB_COUNT=$sc"
+"#,
+        Duration::from_secs(30),
     );
 
-    let cache = env.fresh_cache("cache_invokeprompt");
-    let mut session = env.spawn_interactive(&cache, &init_marked_path);
-    session.send_and_pump("\r", Duration::from_millis(3000));
-
-    let marker_written = fs::read_to_string(&marker_file).map(|s| s.contains("INVOKEPROMPT_CALLED")).unwrap_or(false);
-    warn_check(
-        marker_written,
-        "check3b: OnIdle completion handler genuinely executed and called InvokePrompt()",
-        "no marker written -- expected on hosts where PowerShell.OnIdle stops firing after a \
-         child process is spawned from the async job; the cache still populates correctly per check 2",
+    let job_count = extract_var(&log, "JOB_COUNT");
+    let sub_count = extract_var(&log, "SUB_COUNT");
+    assert_eq!(
+        job_count,
+        Some("0"),
+        "check3a: no PowerShell job should ever be created; log: {log}"
     );
-
-    // Separately, look for the VISIBLE prompt changing content in place: two
-    // distinct SLOW-<timestamp> markers appearing in the same session
-    // without a second Enter beyond the one that triggered the initial
-    // (cold) draw. Also advisory, for the same reason.
-    let slow_markers = session.distinct_markers(r"SLOW-[0-9]+");
-    warn_check(
-        slow_markers.len() >= 2,
-        "check3c: visible prompt content changed in place after async refresh",
-        format!(
-            "only {} distinct SLOW marker(s) observed -- in-place repaint not proven visually \
-             (expected when OnIdle isn't firing on this host, see above)",
-            slow_markers.len()
-        ),
+    assert_eq!(
+        sub_count,
+        Some("0"),
+        "check3b: no event subscription should ever be created; log: {log}"
     );
 }
 
-/// CHECK 4: after many rapid prompt cycles, Get-Job/Get-EventSubscriber stay
-/// bounded (never grow unboundedly), and settle to exactly zero only after
-/// an explicit session exit (Remove-Module -> OnRemove ->
-/// __starship_cleanup_async). `Get-EventSubscriber` needs `-Force` to see
-/// `-SupportEvent` subscriptions at all.
+/// CHECK 4: rapid prompt cycles fire overlapping fire-and-forget refreshes;
+/// each is a bounded one-shot render (the slow module's 0.3s sleep) and
+/// process-managed by the OS, not by starship.ps1 -- none may still be
+/// running once they've had time to finish.
 #[test]
-fn check4_no_unbounded_leaks_across_rapid_cycles() {
+fn check4_no_orphaned_refresh_processes_after_rapid_cycles() {
     let env = Ps1Env::new();
     let cache = env.fresh_cache("cache_leak");
 
-    let log = env.run_file(
+    env.run_file(
         "leak_check.ps1",
         &cache,
         r#"$env:STARSHIP_CONFIG = '{config}'
@@ -482,78 +419,23 @@ Set-Location '{root}'
 Import-Module PSReadLine -ErrorAction SilentlyContinue
 . '{init}'
 
-$maxJobs = 0
-$maxSubs = 0
 for ($i = 0; $i -lt 8; $i++) {{
     $null = prompt
-    Start-Sleep -Milliseconds 400
-    $jc = (Get-Job -ErrorAction SilentlyContinue | Measure-Object).Count
-    $sc = (Get-EventSubscriber -Force -ErrorAction SilentlyContinue | Measure-Object).Count
-    if ($jc -gt $maxJobs) {{ $maxJobs = $jc }}
-    if ($sc -gt $maxSubs) {{ $maxSubs = $sc }}
 }}
-Write-Host "LEAK_MAX_JOB_COUNT=$maxJobs"
-Write-Host "LEAK_MAX_SUB_COUNT=$maxSubs"
-
-# Explicit session-exit cleanup: must reach exactly zero.
-Remove-Module starship -ErrorAction SilentlyContinue
-Start-Sleep -Milliseconds 200
-$finalJobs = (Get-Job -ErrorAction SilentlyContinue | Measure-Object).Count
-$finalSubs = (Get-EventSubscriber -Force -ErrorAction SilentlyContinue | Measure-Object).Count
-Write-Host "LEAK_FINAL_JOB_COUNT=$finalJobs"
-Write-Host "LEAK_FINAL_SUB_COUNT=$finalSubs"
+Start-Sleep -Milliseconds 1500
+Write-Host DONE
 "#,
         Duration::from_secs(40),
     );
 
-    let max_job_count = extract_var(&log, "LEAK_MAX_JOB_COUNT").and_then(|v| v.parse::<i64>().ok());
-    let max_sub_count = extract_var(&log, "LEAK_MAX_SUB_COUNT").and_then(|v| v.parse::<i64>().ok());
-    let final_job_count = extract_var(&log, "LEAK_FINAL_JOB_COUNT");
-    let final_sub_count = extract_var(&log, "LEAK_FINAL_SUB_COUNT");
-
-    // Bounded, generous headroom (2) for at-most-one-outstanding-generation:
-    // only fails if job/subscription count grows with iteration count, i.e.
-    // a genuine unbounded leak.
-    assert!(
-        max_job_count.is_some_and(|c| c <= 2),
-        "check4a: Get-Job count should stay bounded across 8 rapid prompt cycles: \
-         LEAK_MAX_JOB_COUNT={max_job_count:?}; log: {log}"
-    );
-    assert!(
-        max_sub_count.is_some_and(|c| c <= 2),
-        "check4b: Get-EventSubscriber count should stay bounded across 8 rapid prompt cycles: \
-         LEAK_MAX_SUB_COUNT={max_sub_count:?}; log: {log}"
-    );
-    // check4c is ADVISORY, not a hard failure: independently confirmed (via
-    // an isolated repro with zero starship.ps1 code -- a bare New-Module
-    // with an OnRemove handler that writes a marker file) that
-    // `$ExecutionContext.SessionState.Module.OnRemove` never fires at all on
-    // Remove-Module on this pwsh 7.7.0-preview.2 build. That's what
-    // `__starship_cleanup_async` relies on to reap the last outstanding job
-    // at session exit, so on this build the job legitimately survives until
-    // process teardown reaps it at the OS level -- a distinct, previously
-    // undiscovered platform limitation alongside the PowerShell.OnIdle one
-    // documented in src/init/starship.ps1. Not a bug in starship.ps1 (the
-    // OnRemove registration itself is correct) and not fixable there.
-    // check4d (event subscribers) still passes: subscriptions get torn down
-    // on runspace/module-scope exit through a different, unrelated path that
-    // doesn't depend on OnRemove firing.
-    warn_check(
-        final_job_count == Some("0"),
-        "check4c: Get-Job settles to exactly zero after session exit (Remove-Module -> OnRemove)",
-        format!("LEAK_FINAL_JOB_COUNT={final_job_count:?}; log: {log}"),
-    );
-    assert!(
-        final_sub_count == Some("0"),
-        "check4d: Get-EventSubscriber should settle to exactly zero after session exit: \
-         LEAK_FINAL_SUB_COUNT={final_sub_count:?}; log: {log}"
-    );
+    let pattern = format!("{} prompt --deferred", STARSHIP_BIN.display());
+    super::assert_no_orphaned_processes(&pattern, env.path());
 }
 
-/// CHECK 5: `STARSHIP_ASYNC=0` skips the job/event machinery entirely and
-/// matches the old fully synchronous behavior.
+/// CHECK 5: `STARSHIP_ASYNC=0` skips the fire-and-forget refresh entirely,
+/// never touches the cache, and matches the old fully synchronous behavior.
 #[test]
-fn check5_async_disabled_skips_job_machinery() {
+fn check5_async_disabled_skips_refresh_and_cache() {
     let env = Ps1Env::new();
     let cache = env.fresh_cache("cache_disabled");
 
@@ -589,16 +471,29 @@ Write-Host "DISABLED_JOB_COUNT=$jobCount"
         "check5b: STARSHIP_ASYNC=0 should still render the slow module synchronously: \
          DISABLED_HAS_SLOW={disabled_has_slow:?}; log: {log}"
     );
+    assert_eq!(
+        count_files_recursive(&cache),
+        0,
+        "check5c: STARSHIP_ASYNC=0 should never write to the cache (no --deferred fired)"
+    );
 }
 
 /// Live updates (`refresh_interval`) are intentionally a no-op for PowerShell:
 /// there is no thread-safe way to drive PSReadLine's InvokePrompt from a
-/// periodic timer, so the init must not wire a ticker (no `refresh-interval`).
+/// periodic timer, so the fire-and-forget refresh must run without `--watch`.
 #[test]
 fn live_update_tick_not_wired_for_powershell() {
     let init = substituted_init_script("src/init/starship.ps1");
+    // Check the actual `Invoke-Native ... -Arguments (... + "--deferred")`
+    // invocation line, not the whole file text: a bare `contains("--watch")`
+    // would also match this file's own explanatory prose about why
+    // `--watch` is deliberately NOT passed.
+    let invocation = init
+        .lines()
+        .find(|l| l.contains("\"--deferred\""))
+        .unwrap_or_else(|| panic!("no `--deferred` invocation found in starship.ps1"));
     assert!(
-        !init.contains("refresh-interval"),
-        "starship.ps1 calls `starship refresh-interval`: a live-update ticker was wired for a shell that can't repaint the prompt mid-idle"
+        !invocation.contains("--watch"),
+        "starship.ps1's --deferred invocation passes --watch: a live-update ticker was wired for a shell that can't repaint the prompt mid-idle: {invocation:?}"
     );
 }

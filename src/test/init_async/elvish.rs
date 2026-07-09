@@ -97,7 +97,7 @@ impl ElvishEnv {
     /// on-disk `cache` subdirectory, keyed by file name. Used, like the
     /// original marker-file timestamp technique in the Python driver, as an
     /// independent clock (filesystem mtimes on the on-disk cache itself) to
-    /// prove the redraw happens only after the background `--async` run
+    /// prove the redraw happens only after the background `--deferred` run
     /// actually wrote the cache -- not immediately, and not never.
     fn cache_mtimes(&self) -> std::collections::BTreeMap<String, SystemTime> {
         let dir = self.scratch.cache_path.join("cache");
@@ -162,7 +162,7 @@ fn warm_prompt_shows_cached_content() {
     session.kill();
 }
 
-/// The redraw happens only after the background `--async` process
+/// The redraw happens only after the background `--deferred` process
 /// completes: the on-disk cache file's mtime must be >= the command-submit
 /// time (i.e. the refresh actually ran and wrote the cache after the command
 /// was submitted, not before / not never), and the settled prompt reflects
@@ -270,9 +270,10 @@ fn job_finished_notification_is_fully_suppressed() {
     );
 }
 
-/// No orphaned `starship prompt --async` processes survive a burst of
+/// No orphaned `starship prompt --deferred` processes survive a burst of
 /// rapid-fire commands (each faster than the slow module's sleep, so
-/// refreshes overlap/queue up repeatedly).
+/// refreshes overlap/queue up repeatedly -- Elvish never cancels an in-flight
+/// refresh, so each must finish its bounded render and exit on its own).
 #[test]
 fn no_orphans_after_rapid_fire_commands() {
     let env = ElvishEnv::new();
@@ -292,7 +293,7 @@ fn no_orphans_after_rapid_fire_commands() {
     session.kill();
 
     std::thread::sleep(Duration::from_millis(500));
-    let pattern = format!("{} prompt --async", STARSHIP_BIN.display());
+    let pattern = format!("{} prompt --deferred", STARSHIP_BIN.display());
     assert_no_orphaned_processes(&pattern, env.scratch.path());
 }
 
@@ -421,12 +422,20 @@ fn no_leftover_starship_processes_after_full_cycle() {
 /// Live updates (`refresh_interval`) are intentionally a no-op for Elvish:
 /// there is no primitive to recompute the prompt while the editor sits idle
 /// (`edit:redraw` reuses the per-edit-cycle prompt result), so the init script
-/// must not install any background ticker/timer for it.
+/// must run its refresh as a one-shot `--deferred` without `--watch` -- a
+/// ticking watcher would never exit and Elvish waits on the job to redraw.
 #[test]
 fn live_update_tick_not_wired_for_elvish() {
     let init = substituted_init_script("src/init/starship.elv");
+    // Check the actual `prompt --deferred` invocation line, not the whole
+    // file text: a bare `contains("--watch")` would also match this file's
+    // own explanatory prose about why `--watch` is deliberately NOT passed.
+    let invocation = init
+        .lines()
+        .find(|l| l.contains("prompt --deferred"))
+        .unwrap_or_else(|| panic!("no `prompt --deferred` invocation found in starship.elv"));
     assert!(
-        !init.contains("refresh-interval"),
-        "starship.elv calls `starship refresh-interval`: a live-update ticker was wired for a shell that can't repaint the prompt mid-idle"
+        !invocation.contains("--watch"),
+        "starship.elv's `prompt --deferred` call passes --watch: a live-update ticker was wired for a shell that can't repaint the prompt mid-idle: {invocation:?}"
     );
 }

@@ -1,4 +1,4 @@
-use clap::{ValueEnum, builder::PossibleValue};
+use clap::{builder::PossibleValue, ValueEnum};
 use nu_ansi_term::AnsiStrings;
 use rayon::prelude::*;
 use regex::Regex;
@@ -15,8 +15,8 @@ use unicode_width::UnicodeWidthChar;
 use crate::configs::PROMPT_ORDER;
 use crate::context::{Context, Properties, Shell, Target};
 use crate::formatter::{StringFormatter, VariableHolder};
-use crate::module::ALL_MODULES;
 use crate::module::Module;
+use crate::module::ALL_MODULES;
 use crate::modules;
 use crate::segment::Segment;
 use crate::shadow;
@@ -75,6 +75,54 @@ pub fn prompt(args: Properties, target: Target) {
     let mut handle = stdout.lock();
 
     write!(handle, "{}", get_prompt(&context)).unwrap();
+}
+
+/// The background half of the async prompt (`starship prompt --deferred`).
+///
+/// Renders both prompts with every module computed live, which — in
+/// [`crate::cache::ExecMode::Refresh`] — records the slow ones. The rendered
+/// text itself is discarded: the cache is the transport, and the shell
+/// repaints by re-running its fast `--cached` paint.
+///
+/// Once the cache is fresh, one "poke" line is printed so the shell knows to
+/// repaint. With `watch`, a further poke follows every configured
+/// `refresh_interval` seconds so dynamic modules (e.g. `time`) keep advancing
+/// while the prompt sits idle; ticks recompute nothing here — the shell's
+/// `--cached` repaint recomputes the fast modules and replays the slow ones.
+/// The process exits when the interval is 0 or the shell stops listening
+/// (poke writes fail once the pipe closes).
+pub fn deferred(args: Properties, watch: bool) {
+    let context = Context::new(args.clone(), Target::Main);
+    let interval = context.root_config.refresh_interval;
+    let dir = context.current_dir.clone();
+
+    let _ = get_prompt(&context);
+    drop(context);
+    let _ = get_prompt(&Context::new(args, Target::Right));
+
+    crate::cache::flush(&dir);
+    // Prune snapshots of abandoned directories while we're here, like log
+    // cleanup.
+    crate::cache::cleanup();
+
+    if !poke() || !watch || interval == 0 {
+        return;
+    }
+    loop {
+        std::thread::sleep(Duration::from_secs(interval));
+        if !poke() {
+            return;
+        }
+    }
+}
+
+/// Tell the shell to repaint. Returns whether anyone is still listening.
+fn poke() -> bool {
+    let mut stdout = io::stdout();
+    stdout
+        .write_all(b"\n")
+        .and_then(|()| stdout.flush())
+        .is_ok()
 }
 
 pub fn prompt_with_claude_code(args: Properties, target: Target) {

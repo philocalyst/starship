@@ -1,14 +1,6 @@
 set-env STARSHIP_SHELL "elvish"
 set-env STARSHIP_SESSION_KEY (to-string (randint 10000000000000 10000000000000000))
 
-# Opt-in to async prompt repainting (default on, like Zsh).
-# When enabled:
-#   * Plain starship prompt      => fast CacheRead (slow work from cache/omitted)
-#   * starship prompt --async    => background Refresh (full compute + cache write)
-# Prompt fns snapshot args + do fast paint, schedule bg refresh; edit:redraw &full
-# forces Elvish to re-evaluate the prompt closures (now seeing fresh values).
-if (eq $E:STARSHIP_ASYNC '') { set-env STARSHIP_ASYNC 1 }
-
 # Define Hooks
 var cmd-status-code = 0
 
@@ -29,77 +21,65 @@ fn starship-after-command-hook {|m|
 # Install Hooks
 set edit:after-command = [ $@edit:after-command $starship-after-command-hook~ ]
 
-# -------------------------------------------------------------------
-# Full async prompt support.
-# - edit:redraw &full=$true for complete repaint (left + right prompt).
-# - Snapshot of *all* args (duration, jobs, status, path) taken in after-command
-#   (accurate $edit:command-duration for the finished command).
-# - Right prompt supported: same cache warming serves --right calls; redraw
-#   updates both sides. Direct rprompt calls also benefit from CacheRead.
-# - STARSHIP_ASYNC enables CacheRead (plain calls in prompt fns) / Refresh (--async).
+# Async prompt (opt out with STARSHIP_ASYNC=0): the prompt closures below do
+# instant --cached paints (slow modules served from the on-disk cache), and
+# after each command one background `starship prompt --deferred` recomputes
+# both prompts and rewrites that cache; `edit:redraw &full` then re-evaluates
+# the closures so they pick up the fresh values.
 #
-# Note: Elvish has no supported way for a script to obtain the PID/job handle
-# of a command it backgrounds with `&` (`{ ... } &` runs as a goroutine within
-# the same Elvish process and returns no value), and the `jobs` builtin is not
-# an interactive job-table introspection facility that can be parsed to find
-# it after the fact. So an in-flight refresh is not cancelled when a new
-# command completes; it's simply left to finish on its own. This is safe
-# because cache.rs writes are atomic (tmp file + rename) per cache key, so an
-# overlapping refresh can only ever be superseded by a newer one, never
-# corrupt the cache.
-# -------------------------------------------------------------------
+# $-starship-paint splices to --cached when async is on, to nothing when off.
+var -starship-paint = []
 
 if (not-eq $E:STARSHIP_ASYNC '0') {
+    set -starship-paint = [--cached]
+
     # Suppress the "job ... finished" notification for background refreshes.
     # This must be set globally (not via `tmp` inside the hook below): `tmp`
     # restores its old value when the *enclosing function* returns, which
-    # happens immediately after backgrounding -starship-async-refresh-job,
-    # long before that job actually finishes and the notification would fire.
+    # happens immediately after backgrounding -starship-defer-job, long
+    # before that job actually finishes and the notification would fire.
     set notify-bg-job-success = $false
 
     # Named function (rather than an inline `{ ... }` literal) so that if a
     # notification ever is printed, Elvish shows a short `job <name> &
     # finished` line instead of dumping this function's entire source text.
-    fn -starship-async-refresh-job {|jobs-count cmd-duration status-code logical-path|
-        # Background Refresh: full recompute + cache write. Output discarded;
-        # the side-effect is the updated cache for subsequent plain calls.
-        ::STARSHIP:: prompt --async --jobs=$jobs-count --cmd-duration=$cmd-duration --status=$status-code --logical-path=$logical-path >/dev/null
-        # Full redraw so that both left prompt and rprompt are repainted
-        # using fresh CacheRead results (slow modules now populated).
+    #
+    # Elvish has no supported way for a script to obtain the PID/job handle of
+    # a command it backgrounds with `&`, so an in-flight refresh is never
+    # cancelled -- it's left to finish on its own. That is safe: the cache is
+    # written atomically (temp file + rename), so an overlapping refresh can
+    # only be superseded by a newer one, never corrupt the cache. The poke
+    # line `--deferred` prints is discarded; the redraw below is the repaint
+    # signal here.
+    fn -starship-defer-job {|jobs-count cmd-duration status-code logical-path|
+        ::STARSHIP:: prompt --deferred --jobs=$jobs-count --cmd-duration=$cmd-duration --status=$status-code --logical-path=$logical-path >/dev/null
         edit:redraw &full=$true
     }
 
-    fn starship-async-refresh {|m|
+    fn -starship-defer {|m|
         # Snapshot *all* relevant args accurately at command completion time.
         var cmd-duration = (printf "%.0f" (* $edit:command-duration 1000))
-        var status-code = $cmd-status-code
-        var jobs-count = $num-bg-jobs
-        var logical-path = $pwd
-
-        -starship-async-refresh-job $jobs-count $cmd-duration $status-code $logical-path &
+        -starship-defer-job $num-bg-jobs $cmd-duration $cmd-status-code $pwd &
     }
 
-    set edit:after-command = [ $@edit:after-command $starship-async-refresh~ ]
+    set edit:after-command = [ $@edit:after-command $-starship-defer~ ]
 }
 
-# Install starship.
-# Plain calls here become CacheRead (fast) when STARSHIP_ASYNC != 0.
-# Right prompt is fully supported and receives the same cache benefits;
-# redraw &full above ensures rprompt is also updated.
+# Install starship
 set edit:prompt = {
     var cmd-duration = (printf "%.0f" (* $edit:command-duration 1000))
-    ::STARSHIP:: prompt --jobs=$num-bg-jobs --cmd-duration=$cmd-duration --status=$cmd-status-code --logical-path=$pwd
+    ::STARSHIP:: prompt $@-starship-paint --jobs=$num-bg-jobs --cmd-duration=$cmd-duration --status=$cmd-status-code --logical-path=$pwd
 }
 
 set edit:rprompt = {
     var cmd-duration = (printf "%.0f" (* $edit:command-duration 1000))
-    ::STARSHIP:: prompt --right --jobs=$num-bg-jobs --cmd-duration=$cmd-duration --status=$cmd-status-code --logical-path=$pwd
+    ::STARSHIP:: prompt $@-starship-paint --right --jobs=$num-bg-jobs --cmd-duration=$cmd-duration --status=$cmd-status-code --logical-path=$pwd
 }
 
-# Live-update tick (root `refresh_interval`): not wired for Elvish. A periodic
-# repaint would need the prompt *content* to be recomputed while the editor
-# sits idle, but Elvish evaluates the prompt closures once per edit cycle and
-# `edit:redraw &full` reuses that result mid-cycle (a background goroutine can
-# call it without error, but the clock stays frozen until the next command).
-# Elvish exposes no timer/hook that recomputes the prompt during an idle read,
-# so live updates are a no-op here; the async refresh above is unaffected.
+# Live-update tick (root `refresh_interval`): not wired for Elvish, so the
+# refresh above runs `--deferred` without `--watch`. A periodic repaint would
+# need the prompt *content* to be recomputed while the editor sits idle, but
+# Elvish evaluates the prompt closures once per edit cycle and `edit:redraw
+# &full` reuses that result mid-cycle (verified: the clock stays frozen until
+# the next command). Elvish exposes no timer/hook that recomputes the prompt
+# during an idle read, so live updates are a no-op here.

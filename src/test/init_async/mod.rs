@@ -42,7 +42,6 @@ use std::time::{Duration, Instant};
 pub mod bash;
 pub mod elvish;
 pub mod fish;
-pub mod lua_static;
 pub mod ps1;
 pub mod xonsh;
 pub mod zsh;
@@ -268,16 +267,6 @@ impl PtySession {
     /// visible screen has already scrolled past.
     pub fn raw_transcript(&self) -> String {
         String::from_utf8_lossy(&self.raw_log).into_owned()
-    }
-
-    /// The set of distinct substrings in the transcript so far matching
-    /// `pattern` (a regex) -- see [`unique_matches`]. The standard way these
-    /// tests prove a background refresh's output genuinely landed and
-    /// changed content: count distinct `SLOW-<timestamp>`-style markers
-    /// rather than just checking that *some* marker is present (which
-    /// cached/replayed or unchanged output would also satisfy).
-    pub fn distinct_markers(&self, pattern: &str) -> std::collections::BTreeSet<String> {
-        unique_matches(&self.raw_transcript(), pattern)
     }
 
     /// Extract the payload following the last occurrence of `TAG:` in the

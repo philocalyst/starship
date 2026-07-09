@@ -10,88 +10,67 @@ function __starship_set_job_count --description 'Set STARSHIP_JOBS using fish jo
     end    
 end
 
-function __starship_fire_async --argument-names cmd_status cmd_pipestatus keymap duration jobs
-    # Fire a background `starship prompt --async` (Refresh) using the provided
-    # context. Its stdout is discarded; it exists to (re)populate the cache.
-    # We also fire one for --right so that fish_right_prompt benefits.
-    # After both complete we twiddle a universal var; the --on-variable handler
-    # then does `commandline -f repaint` so the next prompt draw (via CacheRead)
-    # will see fresh cached values.
+function __starship_defer --description 'Launch the background refresh/live-update watcher'
+    # One background `starship prompt --deferred --watch`: it recomputes both
+    # prompts, rewrites the on-disk cache the --cached paints read, then
+    # prints one line per repaint this session should do -- one when the
+    # refresh lands, then one per configured `refresh_interval` tick so
+    # dynamic modules (e.g. `time`) keep advancing while the prompt sits
+    # idle. Each line twiddles a per-session universal variable; the
+    # --on-variable handler repaints, re-running fish_prompt's --cached paint.
     #
-    # The ready variable is scoped by this session's PID ($fish_pid, captured
-    # in $__starship_async_ready_var below). Universal variables are shared by
-    # every fish process on the machine, so an unscoped name would make one
-    # session's completed refresh trigger repaints (and eventually erasure
-    # events) in every other unrelated fish session/tab.
-    # Kill any previous bg refresh (for rapid successive prompts).
-    __starship_kill_async
+    # The variable is scoped by this session's PID (see $__starship_defer_var
+    # below): universal variables are shared by every fish process on the
+    # machine, so an unscoped name would repaint every unrelated session/tab.
+    #
+    # IMPORTANT: this must be a genuine external `fish -c` process (context
+    # passed via `env`), NOT an inline `begin ... | while ...; end &` in this
+    # shell. Confirmed by direct testing: backgrounding a `begin...end` block
+    # that contains a pipe does not let fish kill the whole unit -- `kill` on
+    # its reported pid is a no-op, so with `refresh_interval > 0` the ticking
+    # `starship --deferred --watch` process (and the `while read` consuming
+    # it) leaks forever, once per command run, and is never reaped. A plain
+    # external process backgrounded with `&` does not have this problem:
+    # killing it actually terminates it, which closes its read end of the
+    # pipe, which gives the still-running `starship` child an EPIPE on its
+    # next poke -- so it exits on its own within one refresh_interval tick.
+    __starship_defer_kill
+    # Resolve the currently-running fish's own absolute path rather than
+    # relying on a bare `fish` resolving via $PATH: confirmed by a real user
+    # report that this is not a given (e.g. `nix run nixpkgs#fish` does not
+    # necessarily put `fish` itself on $PATH for child processes), which
+    # silently prevented the watcher from ever starting -- no error surfaced
+    # to the user, the cache just never updated. $__fish_bin_dir is a
+    # long-standing internal fish variable pointing at the directory
+    # containing the exact fish binary currently running, so this works
+    # regardless of $PATH state.
     env \
         COLUMNS="$COLUMNS" \
-        STARSHIP_CMD_STATUS="$cmd_status" \
-        STARSHIP_CMD_PIPESTATUS="$cmd_pipestatus" \
-        STARSHIP_KEYMAP="$keymap" \
-        STARSHIP_DURATION="$duration" \
-        STARSHIP_JOBS="$jobs" \
-        STARSHIP_ASYNC_READY_VAR="$__starship_async_ready_var" \
-        fish -c '
-            ::STARSHIP:: prompt --async \
+        STARSHIP_CMD_STATUS="$STARSHIP_CMD_STATUS" \
+        STARSHIP_CMD_PIPESTATUS="$STARSHIP_CMD_PIPESTATUS" \
+        STARSHIP_KEYMAP="$STARSHIP_KEYMAP" \
+        STARSHIP_DURATION="$STARSHIP_DURATION" \
+        STARSHIP_JOBS="$STARSHIP_JOBS" \
+        STARSHIP_DEFER_VAR="$__starship_defer_var" \
+        "$__fish_bin_dir/fish" -c '
+            ::STARSHIP:: prompt --deferred --watch \
                 --terminal-width="$COLUMNS" \
                 --status="$STARSHIP_CMD_STATUS" \
                 --pipestatus="$STARSHIP_CMD_PIPESTATUS" \
                 --keymap="$STARSHIP_KEYMAP" \
                 --cmd-duration="$STARSHIP_DURATION" \
-                --jobs="$STARSHIP_JOBS" >/dev/null 2>&1
-            ::STARSHIP:: prompt --right --async \
-                --terminal-width="$COLUMNS" \
-                --status="$STARSHIP_CMD_STATUS" \
-                --pipestatus="$STARSHIP_CMD_PIPESTATUS" \
-                --keymap="$STARSHIP_KEYMAP" \
-                --cmd-duration="$STARSHIP_DURATION" \
-                --jobs="$STARSHIP_JOBS" >/dev/null 2>&1
-            set -U $STARSHIP_ASYNC_READY_VAR (random)(random)
+                --jobs="$STARSHIP_JOBS" 2>/dev/null | while read -l __starship_poke
+                set -U $STARSHIP_DEFER_VAR (random)(random)
+            end
         ' &
-    set -g __starship_async_pid $last_pid
+    set -g __starship_defer_pid $last_pid
     disown $last_pid 2>/dev/null
 end
 
-function __starship_kill_async
-    if set -q __starship_async_pid
-        kill $__starship_async_pid 2>/dev/null
-        set -e __starship_async_pid
-    end
-end
-
-function __starship_arm_tick --argument-names interval
-    # Live-update tick: fish has no SIGALRM/TMOUT, so we self-reschedule a
-    # background `sleep $interval` that twiddles a per-session universal var
-    # when it fires; the --on-variable handler then repaints. A tick repaint
-    # re-runs fish_prompt via the (fast) plain prompt CacheRead path, so
-    # dynamic modules (e.g. time) advance while slow modules stay served from
-    # the cache -- a tick never fires a background --async refresh.
-    #
-    # The tick var is scoped by $fish_pid (via $__starship_tick_var below) for
-    # the same reason as the async ready var: universal vars reach every fish
-    # process, so an unscoped name would tick every session/tab.
-    # Guard against overlapping sleeps: only arm if none is pending.
-    if set -q __starship_tick_pid
-        return
-    end
-    set -l tickvar $__starship_tick_var
-    # Background a plain sleep in a forked block (not a fresh `fish -c`, which
-    # would re-read the user's config every tick); setting the universal var
-    # from the child notifies this session's --on-variable handler.
-    begin
-        sleep $interval
-        set -U $tickvar (random)(random)
-    end &
-    set -g __starship_tick_pid $last_pid
-    disown $last_pid 2>/dev/null
-end
-
-function __starship_kill_tick
-    if set -q __starship_tick_pid
-        kill $__starship_tick_pid 2>/dev/null
-        set -e __starship_tick_pid
+function __starship_defer_kill
+    if set -q __starship_defer_pid
+        kill $__starship_defer_pid 2>/dev/null
+        set -e __starship_defer_pid
     end
 end
 
@@ -123,21 +102,9 @@ function fish_prompt
             printf "\e[1;32m❯\e[0m "
         end
     else
-        ::STARSHIP:: prompt --terminal-width="$COLUMNS" --status=$STARSHIP_CMD_STATUS --pipestatus="$STARSHIP_CMD_PIPESTATUS" --keymap=$STARSHIP_KEYMAP --cmd-duration=$STARSHIP_DURATION --jobs=$STARSHIP_JOBS
-        if test "$STARSHIP_ASYNC" != "0"
-            if test "$__starship_async_skip_fire" = "1"
-                set -g __starship_async_skip_fire 0
-            else
-                __starship_fire_async $STARSHIP_CMD_STATUS "$STARSHIP_CMD_PIPESTATUS" $STARSHIP_KEYMAP "$STARSHIP_DURATION" "$STARSHIP_JOBS"
-            end
-            # (Re)arm the live-update tick from the configured refresh_interval
-            # (whole seconds; 0 = disabled). Queried each draw so live config
-            # changes take effect; __starship_arm_tick no-ops if one is pending.
-            set -l __starship_interval (::STARSHIP:: refresh-interval 2>/dev/null)
-            if string match -qr '^[1-9][0-9]*$' -- "$__starship_interval"
-                __starship_arm_tick $__starship_interval
-            end
-        end
+        # $__starship_cached expands to --cached when async is on (see below)
+        # and to nothing when it's off, so this line covers both modes.
+        ::STARSHIP:: prompt $__starship_cached --terminal-width="$COLUMNS" --status=$STARSHIP_CMD_STATUS --pipestatus="$STARSHIP_CMD_PIPESTATUS" --keymap=$STARSHIP_KEYMAP --cmd-duration=$STARSHIP_DURATION --jobs=$STARSHIP_JOBS
     end
 end
 
@@ -165,15 +132,7 @@ function fish_right_prompt
             printf ""
         end
     else
-        ::STARSHIP:: prompt --right --terminal-width="$COLUMNS" --status=$STARSHIP_CMD_STATUS --pipestatus="$STARSHIP_CMD_PIPESTATUS" --keymap=$STARSHIP_KEYMAP --cmd-duration=$STARSHIP_DURATION --jobs=$STARSHIP_JOBS
-        # Participate in async state (skip_fire) so fish_right_prompt is fully
-        # integrated with the async sketch (clear on repaint render). Firing
-        # (incl. right async) stays in left for single launch per cycle.
-        if test "$STARSHIP_ASYNC" != "0"
-            if test "$__starship_async_skip_fire" = "1"
-                set -g __starship_async_skip_fire 0
-            end
-        end
+        ::STARSHIP:: prompt $__starship_cached --right --terminal-width="$COLUMNS" --status=$STARSHIP_CMD_STATUS --pipestatus="$STARSHIP_CMD_PIPESTATUS" --keymap=$STARSHIP_KEYMAP --cmd-duration=$STARSHIP_DURATION --jobs=$STARSHIP_JOBS
     end
 end
 
@@ -185,35 +144,16 @@ builtin functions -e fish_mode_prompt
 
 set -gx STARSHIP_SHELL "fish"
 
-# Default to async prompt support (opt-out: set STARSHIP_ASYNC=0).
-set -q STARSHIP_ASYNC; or set -gx STARSHIP_ASYNC 1
-set -gx STARSHIP_ASYNC $STARSHIP_ASYNC
-
 # Transience related functions
 function __starship_reset_transient --on-event fish_postexec
     set -g TRANSIENT 0
     set -g RIGHT_TRANSIENT 0
-    # Reset async skip so the following normal prompt (left or right) will fire
-    # the bg refresh (covering fish_right_prompt async too). Prevents transients
-    # from leaving stale skip_fire that would suppress async after the cmd.
-    if test "$STARSHIP_ASYNC" != "0"
-        set -g __starship_async_skip_fire 0
-    end
 end
 
 function __starship_transient_execute
     if commandline --is-valid || test -z (commandline | string collect) && not commandline --paging-mode
         set -g TRANSIENT 1
         set -g RIGHT_TRANSIENT 1
-        # Protect async state: clear skip and kill pending refresh so a transient
-        # repaint/execute does not race or leave skip=1 that would disable async
-        # for the command that follows.
-        if test "$STARSHIP_ASYNC" != "0"
-            set -g __starship_async_skip_fire 0
-            if functions -q __starship_kill_async
-                __starship_kill_async
-            end
-        end
         commandline -f repaint
     end
     commandline -f execute
@@ -267,74 +207,75 @@ function disable_transience --description 'remove transient prompt keybindings'
     bind --user -M insert -e \r
 end
 
+# Async prompt (opt out with STARSHIP_ASYNC=0): the prompt functions above do
+# an instant --cached paint, and a single background watcher (__starship_defer)
+# refreshes the cache and pokes this session to repaint.
 if test "$STARSHIP_ASYNC" != "0"
-    set -g __starship_async_skip_fire 0
+    # Make every fast paint a --cached render (slow modules served from the
+    # cache the background watcher maintains).
+    set -g __starship_cached --cached
 
     # Universal variables are broadcast to every fish process on the machine,
-    # not just this session, so the "async refresh finished" signal is scoped
-    # to a per-session variable name (using this shell's PID, which is stable
-    # and unique for its lifetime). This keeps unrelated fish sessions/tabs
-    # from repainting (or firing the erasure event on exit, see cleanup below)
-    # when this session's background refresh completes.
-    # $fish_pid replaced the older %self process expansion in fish 4.0; fall
-    # back to %self on older fish so this still works pre-4.0.
+    # not just this session, so the watcher's repaint signal is scoped to a
+    # per-session variable name (using this shell's PID, which is stable and
+    # unique for its lifetime). $fish_pid replaced the older %self process
+    # expansion in fish 4.0; fall back to %self on older fish.
     if __starship_fish_version_at_least 4.0
-        set -g __starship_async_ready_var "__starship_async_ready_$fish_pid"
+        set -g __starship_defer_var "__starship_defer_$fish_pid"
     else
-        set -g __starship_async_ready_var "__starship_async_ready_"%self
+        set -g __starship_defer_var "__starship_defer_"%self
     end
 
-    function __starship_async_repaint --on-variable $__starship_async_ready_var
-        # A background refresh finished; repaint so fish_prompt / fish_right_prompt
-        # re-run and pick up updated values via (fast) plain prompt CacheRead.
-        # Transient bypass: do not repaint if a transient is active.
+    function __starship_defer_repaint --on-variable $__starship_defer_var
+        # The watcher poked: repaint, so the prompt functions re-run their
+        # --cached paints and pick up the refreshed cache (or advance dynamic
+        # modules on a tick). Never repaint over an active transient prompt.
         if test "$TRANSIENT" = "1"; or test "$RIGHT_TRANSIENT" = "1"
             return
         end
-        set -g __starship_async_skip_fire 1
         commandline -f repaint
     end
 
-    # Live-update tick var: the background sleep in __starship_arm_tick twiddles
-    # this when the refresh interval elapses. Scoped by $fish_pid for the same
-    # cross-session reason as the ready var above.
-    if __starship_fish_version_at_least 4.0
-        set -g __starship_tick_var "__starship_tick_$fish_pid"
-    else
-        set -g __starship_tick_var "__starship_tick_"%self
+    function __starship_defer_postexec --on-event fish_postexec
+        # Snapshot the finished command's context (same capture order as
+        # fish_prompt: pipestatus, then status, before either is clobbered),
+        # then hand it to a fresh watcher. Firing here -- once per executed
+        # command, not in fish_prompt -- keeps repaints from re-firing
+        # refreshes.
+        set -g STARSHIP_CMD_PIPESTATUS $pipestatus
+        set -g STARSHIP_CMD_STATUS $status
+        set -g STARSHIP_DURATION "$CMD_DURATION$cmd_duration"
+        switch "$fish_key_bindings"
+            case fish_hybrid_key_bindings fish_vi_key_bindings fish_helix_key_bindings
+                set -g STARSHIP_KEYMAP "$fish_bind_mode"
+            case '*'
+                set -g STARSHIP_KEYMAP insert
+        end
+        __starship_set_job_count
+        __starship_defer
     end
 
-    function __starship_tick_repaint --on-variable $__starship_tick_var
-        # The interval elapsed; the sleep process has exited, so clear its pid to
-        # allow re-arming, then repaint. A tick only wants the fast CacheRead
-        # paint, so set skip_fire (like __starship_async_repaint) to keep the
-        # following fish_prompt from launching a background --async refresh; that
-        # same fish_prompt re-arms the next tick.
-        set -e __starship_tick_pid
-        if test "$TRANSIENT" = "1"; or test "$RIGHT_TRANSIENT" = "1"
-            return
-        end
-        set -g __starship_async_skip_fire 1
-        commandline -f repaint
+    # Kill the watcher while a command runs so ticks don't repaint over its
+    # output; __starship_defer_postexec starts a fresh one right after.
+    function __starship_defer_preexec --on-event fish_preexec
+        __starship_defer_kill
     end
 
-    # Kill any pending tick before a command runs; the next prompt re-arms it.
-    function __starship_tick_preexec --on-event fish_preexec
-        __starship_kill_tick
+    # Cleanup on exit so no watcher or universal variable outlives the
+    # session. Only this session's own variable is erased.
+    function __starship_defer_cleanup --on-event fish_exit
+        __starship_defer_kill
+        set -e $__starship_defer_var 2>/dev/null
     end
 
-    # Cleanup on exit to avoid leaking uvars or pending jobs. Erase this
-    # session's own ready/tick vars only -- never touch other sessions' entries.
-    function __starship_async_cleanup --on-event fish_exit
-        if functions -q __starship_kill_async
-            __starship_kill_async
-        end
-        if functions -q __starship_kill_tick
-            __starship_kill_tick
-        end
-        set -e $__starship_async_ready_var 2>/dev/null
-        set -e $__starship_tick_var 2>/dev/null
-    end
+    # Deliberately do NOT fire the watcher here at source-time: every other
+    # launch happens from inside an already-running prompt callback
+    # (fish_postexec), after fish has fully returned control from sourcing.
+    # The very first prompt therefore renders live (nothing cached yet
+    # anyway) and the watcher starts normally once the first command
+    # finishes -- this avoids backgrounding a job before fish's own job
+    # control/terminal handoff (particularly via the `psub`-based two-phase
+    # `starship init fish | source`) has settled.
 end
 
 # Set up the session key that will be used to store logs

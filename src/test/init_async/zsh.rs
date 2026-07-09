@@ -177,10 +177,11 @@ fn uniquify() -> usize {
     COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
-/// Instant `CacheRead` paint shows before the background refresh completes,
-/// and once the refresh lands it genuinely redraws the prompt in place via
-/// `zle -F` + `zle reset-prompt` (proven via unique per-render markers) --
-/// on both `PROMPT` and `RPROMPT` simultaneously.
+/// Instant `--cached` paint shows before the background refresh completes,
+/// and once the single `--deferred --watch` watcher's refresh lands, its poke
+/// genuinely redraws the prompt in place via `zle -F` + `zle reset-prompt`
+/// (proven via unique per-render markers) -- on both `PROMPT` and `RPROMPT`
+/// from the one shared refresh.
 #[test]
 fn instant_paint_then_redraw_in_place_on_both_sides() {
     let env = ZshEnv::new();
@@ -188,13 +189,10 @@ fn instant_paint_then_redraw_in_place_on_both_sides() {
     session.send_and_pump("echo BEGIN_CYCLE\r", Duration::from_millis(500));
     // Give the background refresh (sleep 0.2 in each module) time to land
     // and fire its zle -F callback before we look at the redrawn prompt.
-    // Poll for it rather than a fixed sleep: launching both the left and
-    // right refreshes concurrently roughly doubles fork/exec overhead
-    // versus the single-sided checks below, so a fixed short sleep can
-    // flake under system load. Wait for a *second* distinct marker on each
-    // side (proving a real redraw happened, not just the initial paint)
-    // rather than for any specific text, since that's what this check is
-    // actually about.
+    // Poll for it rather than a fixed sleep, so this doesn't flake under
+    // system load. Wait for a *second* distinct marker on each side (proving
+    // a real redraw happened, not just the initial paint) rather than for
+    // any specific text, since that's what this check is actually about.
     session.wait_until(Duration::from_secs(8), |t| {
         left_slow_markers(t).len() >= 2 && unique_matches(t, r"RSLOW-[0-9]+").len() >= 2
     });
@@ -364,11 +362,11 @@ fn disabled_async_installs_no_functions_or_state() {
     let env = ZshEnv::new();
     let mut session = env.spawn(&config_both(), "0");
     session.send_and_pump(
-        "print -r -- ASYNC_FN_COUNT_IS:$(typeset -f | grep -c _starship_async):END\r",
+        "print -r -- ASYNC_FN_COUNT_IS:$(typeset -f | grep -c _starship_defer):END\r",
         Duration::from_millis(500),
     );
     session.send_and_pump(
-        "print -r -- FDVAR_IS:$_STARSHIP_ASYNC_PROMPT_FD:END\r",
+        "print -r -- FDVAR_IS:$_STARSHIP_DEFER_FD:END\r",
         Duration::from_millis(500),
     );
     session.send_and_pump("echo M1\r", Duration::from_secs(1));
@@ -588,10 +586,11 @@ success_symbol = "[>](green)"
     )
 }
 
-/// With `refresh_interval > 0`, the shell repaints on its own `TMOUT`/
-/// `TRAPALRM` timer while the user sits idle (no keypress), so a live module
-/// like `time` advances -- the clock shows more than one distinct value
-/// across a few seconds of idling. This is the core "live update" behavior.
+/// With `refresh_interval > 0`, the `--deferred --watch` watcher keeps
+/// emitting poke lines while the user sits idle (no keypress), each one
+/// repainted by the shared `zle -F` callback, so a live module like `time`
+/// advances -- the clock shows more than one distinct value across a few
+/// seconds of idling. This is the core "live update" behavior.
 #[test]
 fn live_tick_advances_time_module_while_idle() {
     let env = ZshEnv::new();
@@ -608,41 +607,62 @@ fn live_tick_advances_time_module_while_idle() {
     );
 }
 
-/// The tick is opt-in: with the default `refresh_interval = 0` no zsh timer
-/// (`TMOUT`) is armed, and with a positive value it is armed to that value.
+/// The tick lives inside the watcher, which reads `refresh_interval` itself:
+/// with the default `0` the watcher exits right after its refresh poke, and
+/// with a positive value it stays alive ticking until the shell replaces or
+/// cancels it -- and never outlives the session (zshexit cleanup).
 #[test]
-fn live_tick_arms_tmout_only_when_configured() {
+fn watcher_lifetime_follows_refresh_interval() {
     let env = ZshEnv::new();
+    let watch_pattern = format!("{} prompt --deferred --watch", STARSHIP_BIN.display());
+
+    // Poll rather than a single fixed pump: under the default parallel test
+    // runner, several pty-backed tests spawn their own zsh + starship
+    // processes at once, and fork/exec contention on a loaded machine can
+    // make a fixed short wait budget flake (see the similar comments
+    // elsewhere in this file on why waits here are generous).
+    let watcher_present = |session: &mut PtySession, timeout: Duration| -> bool {
+        let deadline = std::time::Instant::now() + timeout;
+        loop {
+            if !super::pids_matching_with_cwd_under(&watch_pattern, env.workdir.path()).is_empty() {
+                return true;
+            }
+            if std::time::Instant::now() >= deadline {
+                return false;
+            }
+            session.pump(Duration::from_millis(200));
+        }
+    };
 
     let mut off = env.spawn(&config_time(0), "1");
-    off.send_and_pump(
-        "print -r -- TMOUT_IS:${TMOUT:-unset}:END\r",
-        Duration::from_millis(500),
+    // Give the one-shot refresh ample time to land and exit, then confirm it
+    // stays gone (rather than just "hasn't appeared yet").
+    off.pump(Duration::from_secs(3));
+    assert!(
+        super::pids_matching_with_cwd_under(&watch_pattern, env.workdir.path()).is_empty(),
+        "watcher still alive despite refresh_interval=0: it should exit right after its refresh poke"
     );
     off.send("exit\r");
     off.pump(Duration::from_secs(1));
-    assert!(
-        off.raw_transcript().contains("TMOUT_IS:unset:END"),
-        "TMOUT was armed despite refresh_interval=0 (saw {:?})",
-        regex::Regex::new(r"TMOUT_IS:[^:]*:END")
-            .unwrap()
-            .find(&off.raw_transcript())
-            .map(|m| m.as_str())
-    );
 
     let mut on = env.spawn(&config_time(1), "1");
-    on.send_and_pump(
-        "print -r -- TMOUT_IS:${TMOUT:-unset}:END\r",
-        Duration::from_millis(500),
+    assert!(
+        watcher_present(&mut on, Duration::from_secs(10)),
+        "no live watcher with refresh_interval=1: ticks have nothing to drive them"
     );
     on.send("exit\r");
-    on.pump(Duration::from_secs(1));
+    on.pump(Duration::from_secs(2));
+    // zshexit's cancel must reap the ticking watcher; an orphan would also
+    // die on its next poke (EPIPE), so poll briefly rather than asserting
+    // instantly.
+    let deadline = std::time::Instant::now() + Duration::from_secs(5);
+    let mut leftover = super::pids_matching_with_cwd_under(&watch_pattern, env.workdir.path());
+    while !leftover.is_empty() && std::time::Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(250));
+        leftover = super::pids_matching_with_cwd_under(&watch_pattern, env.workdir.path());
+    }
     assert!(
-        on.raw_transcript().contains("TMOUT_IS:1:END"),
-        "TMOUT not armed to the configured refresh_interval=1 (saw {:?})",
-        regex::Regex::new(r"TMOUT_IS:[^:]*:END")
-            .unwrap()
-            .find(&on.raw_transcript())
-            .map(|m| m.as_str())
+        leftover.is_empty(),
+        "watcher outlived the zsh session: {leftover:?}"
     );
 }

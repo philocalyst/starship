@@ -229,7 +229,7 @@ This is the list of prompt-wide configuration options.
 > [!NOTE]
 > `refresh_interval` makes the shell repaint the prompt on a timer so dynamic
 > modules keep updating while you sit at the prompt (the [`time`](#time) module
-> is the canonical example). Each tick reuses the fast async paint, so slow
+> is the canonical example). Each tick reuses the fast cached paint, so slow
 > modules are served from cache rather than recomputed. It is currently
 > supported on **Zsh**, **Fish**, and **Xonsh**; Bash, PowerShell, Elvish, and
 > Cmd/Clink cannot repaint the prompt while it sits idle, so the setting is a

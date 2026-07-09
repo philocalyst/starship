@@ -101,162 +101,69 @@ PROMPT='$('::STARSHIP::' prompt --terminal-width="$COLUMNS" --keymap="${KEYMAP:-
 RPROMPT='$('::STARSHIP::' prompt --right --terminal-width="$COLUMNS" --keymap="${KEYMAP:-}" --status="${STARSHIP_CMD_STATUS:-}" --pipestatus="${STARSHIP_PIPE_STATUS[*]:-}" --cmd-duration="${STARSHIP_DURATION:-}" --jobs="$STARSHIP_JOBS_COUNT")'
 PROMPT2="$(::STARSHIP:: prompt --continuation)"
 
-# Render the left (PROMPT) and right (RPROMPT) prompts asynchronously.
-# A fast paint (CacheRead under STARSHIP_ASYNC=1) is shown immediately via
-# the instant expressions (slow modules served from cache or omitted).
-# Separate background renders are then launched (--async and --right --async)
-# and their results captured to redraw via independent zle -F callbacks.
-# This ensures RPROMPT gets its own async path and does not block or wait on
-# the left prompt (and vice versa). Opt out with STARSHIP_ASYNC=0.
-# Set STARSHIP_ASYNC_CACHE=0 to have the instant paint omit slow modules.
-: ${STARSHIP_ASYNC:=1}
-export STARSHIP_ASYNC
+# Async prompt (opt out with STARSHIP_ASYNC=0). Two pieces:
+#   1. PROMPT/RPROMPT run `starship prompt --cached`: an instant paint that
+#      serves slow modules (git status, ...) from the cache maintained by the
+#      background refresh, and computes the fast ones live.
+#   2. precmd launches a single background `starship prompt --deferred
+#      --watch`, which recomputes everything (both sides), rewrites the cache,
+#      and then prints one line per repaint this shell should do: one when the
+#      refresh lands, then one per configured `refresh_interval` tick so
+#      dynamic modules (e.g. `time`) keep advancing while the prompt sits
+#      idle. A single zle -F callback turns each of those lines into
+#      reset-prompt, which re-runs the --cached paint from step 1.
+if [[ ${STARSHIP_ASYNC:-1} != 0 ]]; then
+    PROMPT='$('::STARSHIP::' prompt --cached --terminal-width="$COLUMNS" --keymap="${KEYMAP:-}" --status="${STARSHIP_CMD_STATUS:-}" --pipestatus="${STARSHIP_PIPE_STATUS[*]:-}" --cmd-duration="${STARSHIP_DURATION:-}" --jobs="$STARSHIP_JOBS_COUNT")'
+    RPROMPT='$('::STARSHIP::' prompt --cached --right --terminal-width="$COLUMNS" --keymap="${KEYMAP:-}" --status="${STARSHIP_CMD_STATUS:-}" --pipestatus="${STARSHIP_PIPE_STATUS[*]:-}" --cmd-duration="${STARSHIP_DURATION:-}" --jobs="$STARSHIP_JOBS_COUNT")'
 
-if [[ $STARSHIP_ASYNC != 0 ]]; then
-    # Separate state for left (PROMPT) and right (RPROMPT) async jobs.
-    typeset -g \
-        _STARSHIP_ASYNC_PROMPT_FD=0 _STARSHIP_ASYNC_PROMPT_PID=0 _STARSHIP_ASYNC_PROMPT= \
-        _STARSHIP_ASYNC_RPROMPT_FD=0 _STARSHIP_ASYNC_RPROMPT_PID=0 _STARSHIP_ASYNC_RPROMPT=
+    typeset -g _STARSHIP_DEFER_FD=0 _STARSHIP_DEFER_PID=0
 
-    # Instant (fast) paint expressions. When assigned to PROMPT/RPROMPT these
-    # cause starship to run in CacheRead mode.
-    typeset -g _STARSHIP_INSTANT_PROMPT='$('::STARSHIP::' prompt --terminal-width="$COLUMNS" --keymap="${KEYMAP:-}" --status="${STARSHIP_CMD_STATUS:-}" --pipestatus="${STARSHIP_PIPE_STATUS[*]:-}" --cmd-duration="${STARSHIP_DURATION:-}" --jobs="$STARSHIP_JOBS_COUNT")'
-    typeset -g _STARSHIP_INSTANT_RPROMPT='$('::STARSHIP::' prompt --right --terminal-width="$COLUMNS" --keymap="${KEYMAP:-}" --status="${STARSHIP_CMD_STATUS:-}" --pipestatus="${STARSHIP_PIPE_STATUS[*]:-}" --cmd-duration="${STARSHIP_DURATION:-}" --jobs="$STARSHIP_JOBS_COUNT")'
-
-    # Cancel any in-flight background render for a side. Called before
-    # starting a new one (e.g. rapid cd or prompt sequences) and on exit.
-    _starship_async_cancel_prompt() {
-        (( _STARSHIP_ASYNC_PROMPT_FD )) || return 0
-        zle -F "$_STARSHIP_ASYNC_PROMPT_FD" 2>/dev/null
-        exec {_STARSHIP_ASYNC_PROMPT_FD}<&- 2>/dev/null
-        (( _STARSHIP_ASYNC_PROMPT_PID )) && kill "$_STARSHIP_ASYNC_PROMPT_PID" 2>/dev/null
-        _STARSHIP_ASYNC_PROMPT_FD=0 _STARSHIP_ASYNC_PROMPT_PID=0
+    # Stop the current watcher: detach its callback, close its pipe, kill it.
+    _starship_defer_cancel() {
+        (( _STARSHIP_DEFER_FD )) || return 0
+        zle -F "$_STARSHIP_DEFER_FD" 2>/dev/null
+        exec {_STARSHIP_DEFER_FD}<&- 2>/dev/null
+        (( _STARSHIP_DEFER_PID )) && kill "$_STARSHIP_DEFER_PID" 2>/dev/null
+        _STARSHIP_DEFER_FD=0 _STARSHIP_DEFER_PID=0
     }
 
-    _starship_async_cancel_rprompt() {
-        (( _STARSHIP_ASYNC_RPROMPT_FD )) || return 0
-        zle -F "$_STARSHIP_ASYNC_RPROMPT_FD" 2>/dev/null
-        exec {_STARSHIP_ASYNC_RPROMPT_FD}<&- 2>/dev/null
-        (( _STARSHIP_ASYNC_RPROMPT_PID )) && kill "$_STARSHIP_ASYNC_RPROMPT_PID" 2>/dev/null
-        _STARSHIP_ASYNC_RPROMPT_FD=0 _STARSHIP_ASYNC_RPROMPT_PID=0
-    }
-
-    _starship_async_cancel() {
-        _starship_async_cancel_prompt
-        _starship_async_cancel_rprompt
-    }
-
-    # ZLE callback for the left prompt async result.
-    _starship_async_callback() {
-        local fd=$1
-        # Slurp the rendered prompt (possibly multi-line) up to EOF.
-        IFS= read -rd '' -u "$fd" _STARSHIP_ASYNC_PROMPT 2>/dev/null
-        zle -F "$fd" 2>/dev/null
-        exec {fd}<&- 2>/dev/null
-        _STARSHIP_ASYNC_PROMPT_FD=0 _STARSHIP_ASYNC_PROMPT_PID=0
-        # Assign literally (single quotes) so any embedded $ etc. are not re-expanded.
-        PROMPT='${_STARSHIP_ASYNC_PROMPT}'
-        zle reset-prompt
-    }
-
-    # Separate ZLE callback for the right prompt async result.
-    _starship_async_callback_rprompt() {
-        local fd=$1
-        IFS= read -rd '' -u "$fd" _STARSHIP_ASYNC_RPROMPT 2>/dev/null
-        zle -F "$fd" 2>/dev/null
-        exec {fd}<&- 2>/dev/null
-        _STARSHIP_ASYNC_RPROMPT_FD=0 _STARSHIP_ASYNC_RPROMPT_PID=0
-        RPROMPT='${_STARSHIP_ASYNC_RPROMPT}'
-        zle reset-prompt
-    }
-
-    # Live-update tick: while the user sits idle at the prompt, periodically
-    # re-paint so dynamic modules (e.g. `time`) keep advancing. A tick simply
-    # reverts PROMPT/RPROMPT to the instant (CacheRead) expressions and
-    # `zle reset-prompt`s -- this reuses the fast CacheRead paint, which
-    # computes fast/dynamic modules live and replays slow modules (git, etc.)
-    # from the on-disk cache, so no background `--async` render is launched
-    # (that would recompute the slow modules every tick).
-    typeset -g _STARSHIP_TMOUT=0 _STARSHIP_PRESERVED_TRAPALRM=
-
-    # Preserve any pre-existing user TRAPALRM so we chain to it rather than
-    # clobbering it.
-    if (( ${+functions[TRAPALRM]} )); then
-        functions[_starship_preserved_trapalrm]=$functions[TRAPALRM]
-        _STARSHIP_PRESERVED_TRAPALRM=1
-    fi
-
-    TRAPALRM() {
-        # Chain to any previously-defined user TRAPALRM first.
-        (( _STARSHIP_PRESERVED_TRAPALRM )) && _starship_preserved_trapalrm "$@"
-        # Only repaint while the line editor is active, and avoid disrupting
-        # completion menus / incremental search where a reset-prompt would
-        # interfere.
-        if zle && [[ -z $WIDGET || ( $WIDGET != *complete* && $WIDGET != *search* ) ]]; then
-            PROMPT=$_STARSHIP_INSTANT_PROMPT
-            RPROMPT=$_STARSHIP_INSTANT_RPROMPT
+    # One poke line from the watcher = one repaint (the refresh landed, or a
+    # live-update tick elapsed).
+    _starship_defer_callback() {
+        local fd=$1 _poke
+        if ! IFS= read -r -u "$fd" _poke 2>/dev/null; then
+            # EOF: the watcher exited (refresh_interval is 0, or it was
+            # killed). Detach without kill -- the process is already gone.
+            zle -F "$fd" 2>/dev/null
+            exec {fd}<&- 2>/dev/null
+            if (( fd == _STARSHIP_DEFER_FD )); then
+                _STARSHIP_DEFER_FD=0 _STARSHIP_DEFER_PID=0
+            fi
+            return 0
+        fi
+        # Avoid disrupting completion menus / incremental search, where a
+        # reset-prompt would interfere.
+        if [[ -z $WIDGET || ( $WIDGET != *complete* && $WIDGET != *search* ) ]]; then
             zle reset-prompt
         fi
     }
 
-    # (Re)arm the live-update timer from the configured `refresh_interval`
-    # (whole seconds; 0 = disabled). Queried on every precmd so live config
-    # changes take effect. Preserves a pre-existing user TMOUT: only our own
-    # value is managed here, and TMOUT is restored/unset when disabled.
-    _starship_async_arm_timer() {
-        local interval=$(::STARSHIP:: refresh-interval 2>/dev/null)
-        if [[ $interval == <1-> ]]; then
-            TMOUT=$interval
-            _STARSHIP_TMOUT=$interval
-        elif (( _STARSHIP_TMOUT )); then
-            # We previously armed it; disarm cleanly (only if unchanged by the
-            # user in the meantime).
-            (( TMOUT == _STARSHIP_TMOUT )) && unset TMOUT
-            _STARSHIP_TMOUT=0
-        fi
-    }
-
-    # precmd: install instant paints, launch (or relaunch) the two independent
-    # background renders.
-    _starship_async_refresh() {
-        _starship_async_cancel
-        _starship_async_arm_timer
-        PROMPT=$_STARSHIP_INSTANT_PROMPT
-        RPROMPT=$_STARSHIP_INSTANT_RPROMPT
-
-        exec {_STARSHIP_ASYNC_PROMPT_FD}< <(::STARSHIP:: prompt --async \
+    # precmd: replace any in-flight watcher with a fresh one carrying this
+    # command's context.
+    _starship_defer_start() {
+        _starship_defer_cancel
+        exec {_STARSHIP_DEFER_FD}< <(::STARSHIP:: prompt --deferred --watch \
             --terminal-width="$COLUMNS" \
             --keymap="${KEYMAP:-}" \
             --status="${STARSHIP_CMD_STATUS:-}" \
             --pipestatus="${STARSHIP_PIPE_STATUS[*]:-}" \
             --cmd-duration="${STARSHIP_DURATION:-}" \
             --jobs="$STARSHIP_JOBS_COUNT")
-        _STARSHIP_ASYNC_PROMPT_PID=$!
-        zle -F "$_STARSHIP_ASYNC_PROMPT_FD" _starship_async_callback
-
-        exec {_STARSHIP_ASYNC_RPROMPT_FD}< <(::STARSHIP:: prompt --right --async \
-            --terminal-width="$COLUMNS" \
-            --keymap="${KEYMAP:-}" \
-            --status="${STARSHIP_CMD_STATUS:-}" \
-            --pipestatus="${STARSHIP_PIPE_STATUS[*]:-}" \
-            --cmd-duration="${STARSHIP_DURATION:-}" \
-            --jobs="$STARSHIP_JOBS_COUNT")
-        _STARSHIP_ASYNC_RPROMPT_PID=$!
-        zle -F "$_STARSHIP_ASYNC_RPROMPT_FD" _starship_async_callback_rprompt
+        _STARSHIP_DEFER_PID=$!
+        zle -F "$_STARSHIP_DEFER_FD" _starship_defer_callback
     }
 
-    add-zsh-hook precmd _starship_async_refresh
-
-    # Cleanup on exit: kill any still-running async jobs and close their fds,
-    # and disarm the live-update timer (restoring TMOUT only if it's still our
-    # own value, so a user TMOUT set later is left alone).
-    _starship_async_cleanup() {
-        _starship_async_cancel
-        if (( _STARSHIP_TMOUT )); then
-            (( TMOUT == _STARSHIP_TMOUT )) && unset TMOUT
-            _STARSHIP_TMOUT=0
-        fi
-    }
-    add-zsh-hook zshexit _starship_async_cleanup
+    add-zsh-hook precmd _starship_defer_start
+    add-zsh-hook zshexit _starship_defer_cancel
 fi
 

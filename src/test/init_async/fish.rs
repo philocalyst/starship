@@ -9,11 +9,16 @@
 //! isolated scratch `HOME`/`XDG_*` sandbox so fish's universal variables
 //! (which persist to disk in fish's own state dir) never touch the real
 //! user's config or state.
+//!
+//! The fish model under test: prompts paint with `--cached`; after each
+//! command, `__starship_defer` (fired from `fish_postexec`) launches one
+//! background `starship prompt --deferred --watch` whose poke lines twiddle
+//! a per-session universal variable; the `--on-variable` handler repaints.
 
-use super::{ScratchEnv, substituted_init_script};
+use super::{STARSHIP_BIN, ScratchEnv, pids_matching_with_cwd_under, substituted_init_script};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 /// How long the scratch config's slow `custom` module sleeps for. Comfortably
 /// above `SLOW_MODULE_THRESHOLD` (5ms) but short enough that timing-sensitive
@@ -70,7 +75,6 @@ impl FishEnv {
 
     /// Isolated `HOME`/`XDG_*` env vars rooted at `root`, so universal
     /// variables, config, and cache never touch the real user's environment.
-    /// Mirrors `isolated_env()` in the original shell-script test.
     fn isolated_envs(root: &Path) -> Vec<(String, String)> {
         for sub in [
             "home",
@@ -108,6 +112,7 @@ impl FishEnv {
     fn command_in(&self, root: &Path, script: &str) -> Command {
         let mut cmd = Command::new("fish");
         cmd.arg("-c").arg(script);
+        cmd.current_dir(root);
         for (k, v) in Self::isolated_envs(root) {
             cmd.env(k, v);
         }
@@ -118,8 +123,6 @@ impl FishEnv {
 
     /// Run `fish -c <script>` inside a fresh isolated sandbox (its own
     /// throwaway `HOME`/`XDG_*` root), returning combined stdout+stderr.
-    /// Mirrors `run_fish_isolated()` in the original test, for checks that
-    /// don't need to share their sandbox root with another session.
     fn run(&self, script: &str) -> String {
         use std::sync::atomic::{AtomicU64, Ordering};
         static SESSION_COUNTER: AtomicU64 = AtomicU64::new(0);
@@ -142,23 +145,26 @@ impl FishEnv {
         combined
     }
 
-    /// Snippet setting the standard prompt-context variables and firing a
-    /// background refresh, then blocking (via `kill -0` polling, exactly
-    /// like the original test) until that refresh's `fish -c` subprocess
-    /// exits -- i.e. "fire an async refresh and wait for it to finish".
+    /// Snippet setting the standard prompt-context variables and launching a
+    /// background watcher via the real `__starship_defer`, then blocking (via
+    /// `kill -0` polling) until that watcher's forked block exits -- i.e.
+    /// "fire a refresh and wait for it to finish". Only valid with the
+    /// default `refresh_interval = 0`, where the watcher exits right after
+    /// its refresh poke; a positive interval keeps it alive ticking (see
+    /// [`watcher_lifetime_follows_refresh_interval`]).
     /// Does NOT source the init script itself (see [`Self::source_snippet`]);
     /// callers compose the two so a caller that needs to observe state
     /// between sourcing and firing (e.g. reading off a per-session variable
     /// the init script just assigned) can do so.
     fn fire_and_wait_snippet(&self) -> &'static str {
         r#"
-set STARSHIP_CMD_STATUS 0
-set STARSHIP_CMD_PIPESTATUS 0
-set STARSHIP_KEYMAP insert
-set STARSHIP_DURATION 0
-set STARSHIP_JOBS 0
-__starship_fire_async $STARSHIP_CMD_STATUS $STARSHIP_CMD_PIPESTATUS $STARSHIP_KEYMAP $STARSHIP_DURATION $STARSHIP_JOBS
-set -l p $__starship_async_pid
+set -g STARSHIP_CMD_STATUS 0
+set -g STARSHIP_CMD_PIPESTATUS 0
+set -g STARSHIP_KEYMAP insert
+set -g STARSHIP_DURATION 0
+set -g STARSHIP_JOBS 0
+__starship_defer
+set -l p $__starship_defer_pid
 while kill -0 $p 2>/dev/null
     sleep 0.02
 end
@@ -166,7 +172,7 @@ end
     }
 
     /// Snippet sourcing the init script, then running
-    /// [`Self::fire_and_wait_snippet`] -- the common "source, fire an async
+    /// [`Self::fire_and_wait_snippet`] -- the common "source, fire a
     /// refresh, and wait for it to finish" pattern.
     fn source_fire_and_wait_snippet(&self) -> String {
         format!(
@@ -192,21 +198,9 @@ fn init_script_substitutes_starship_binary_path() {
     );
 }
 
-/// Regression test for the `set -gx STARSHIP_ASYNC` (no value) bug: `set -gx
-/// VAR` with no value argument erases VAR in fish, so this asserts
-/// `STARSHIP_ASYNC` comes out exported as a non-empty `"1"` after sourcing.
-#[test]
-fn starship_async_exported_as_one_after_sourcing() {
-    let env = FishEnv::new();
-    let out = env.run(&format!(
-        "{}\nenv | grep '^STARSHIP_ASYNC='",
-        env.source_snippet()
-    ));
-    assert_eq!(out.trim(), "STARSHIP_ASYNC=1", "got: '{}'", out.trim());
-}
-
 /// A cold prompt (empty cache) must render live output containing both
-/// modules' real values.
+/// modules' real values: `--cached` with nothing recorded falls through and
+/// computes everything live.
 #[test]
 fn cold_prompt_renders_live_output() {
     let env = FishEnv::new();
@@ -216,12 +210,9 @@ fn cold_prompt_renders_live_output() {
     assert!(out.contains("FAST") && out.contains("SLOW"), "got: '{out}'");
 }
 
-/// A warm `CacheRead` prompt must reflect the cached slow-module value
-/// quickly. The cache dir would already have entries from a live compute
-/// (`CacheRead` mode writes-through on live compute of slow modules), but to
-/// be sure the cache is actually populated via the *async refresh* path,
-/// fire it explicitly and wait for completion before measuring the warm
-/// read.
+/// A warm `--cached` prompt must reflect the recorded slow-module value
+/// quickly, once a real background refresh (fired via the real
+/// `__starship_defer`) has populated the cache.
 #[test]
 fn warm_cache_read_reflects_cached_value_quickly() {
     let env = FishEnv::new();
@@ -258,27 +249,86 @@ fn warm_cache_read_reflects_cached_value_quickly() {
     );
 }
 
-/// `__starship_fire_async` must launch a genuine background `fish -c`
-/// subprocess that populates the on-disk cache.
+/// `__starship_defer` must launch a genuine background watcher that
+/// populates the on-disk cache and pokes this session's per-session
+/// universal variable when the refresh lands.
 #[test]
-fn fire_async_populates_on_disk_cache() {
+fn defer_populates_cache_and_pokes_repaint_variable() {
     let env = FishEnv::new();
     env.reset_cache();
 
-    let script = format!("{}\necho DONE", env.source_fire_and_wait_snippet());
-    let out = env.run(&script);
+    let root = env.path().join("session_defer_poke");
+    std::fs::create_dir_all(&root).unwrap();
+    let poke_log = root.join("poke.log");
+    std::fs::write(&poke_log, "").unwrap();
+
+    // A probe handler on the same per-session variable the init script's own
+    // repaint handler watches, logging every poke delivery. The idle-poll
+    // loop services fish's event loop so the universal-variable notification
+    // can be delivered.
+    let script = format!(
+        r#"{source}
+function __probe_poke --on-variable $__starship_defer_var
+    echo POKE_DELIVERED >> '{log}'
+end
+{fire_and_wait}
+for i in (seq 1 20)
+    sleep 0.05
+end
+echo DONE
+"#,
+        source = env.source_snippet(),
+        log = poke_log.display(),
+        fire_and_wait = env.fire_and_wait_snippet(),
+    );
+    let out = env.run_in(&root, &script);
+    let pokes = std::fs::read_to_string(&poke_log).unwrap_or_default();
 
     assert!(out.contains("DONE"), "got: '{out}'");
     assert!(
         env.cache_file_count() > 0,
-        "expected at least one on-disk cache entry after a background refresh"
+        "expected at least one on-disk cache snapshot after a background refresh"
+    );
+    assert!(
+        pokes.contains("POKE_DELIVERED"),
+        "the watcher's refresh poke never twiddled this session's repaint variable; out: '{out}'"
     );
 }
 
-/// The async refresh job must be `disown`ed, keeping it out of `jobs` /
-/// `jobs -p`.
+/// The `fish_postexec` hook is what fires the watcher in real sessions --
+/// repaint-triggered `fish_prompt` re-runs must not fire anything (that's the
+/// point of moving the firing out of `fish_prompt`). `emit fish_postexec`
+/// exercises the real registered handler.
 #[test]
-fn async_job_is_disowned_from_jobs_list() {
+fn postexec_fires_watcher_and_prompt_draw_does_not() {
+    let env = FishEnv::new();
+    env.reset_cache();
+
+    let script = format!(
+        r#"{source}
+fish_prompt >/dev/null
+set -q __starship_defer_pid; and echo 'FIRED_BY_PROMPT:yes'; or echo 'FIRED_BY_PROMPT:no'
+emit fish_postexec 'true'
+set -q __starship_defer_pid; and echo 'FIRED_BY_POSTEXEC:yes'; or echo 'FIRED_BY_POSTEXEC:no'
+__starship_defer_kill
+"#,
+        source = env.source_snippet(),
+    );
+    let out = env.run(&script);
+
+    assert!(
+        out.contains("FIRED_BY_PROMPT:no"),
+        "a bare prompt draw fired the watcher -- repaints would re-fire refreshes; out: '{out}'"
+    );
+    assert!(
+        out.contains("FIRED_BY_POSTEXEC:yes"),
+        "fish_postexec did not fire the watcher; out: '{out}'"
+    );
+}
+
+/// The watcher job must be `disown`ed, keeping it out of `jobs` / `jobs -p`.
+#[test]
+fn watcher_job_is_disowned_from_jobs_list() {
     let env = FishEnv::new();
     env.reset_cache();
 
@@ -305,8 +355,8 @@ echo "JOBS_P_COUNT:"(jobs -p 2>/dev/null | count)
     assert_eq!(jobs_p_count, "0", "full output: '{out}'");
 }
 
-/// Two concurrent, unrelated fish sessions must not leak repaint/ready-
-/// variable state into each other. Regression test for the cross-session
+/// Two concurrent, unrelated fish sessions must not leak repaint-variable
+/// state into each other. Regression test for the cross-session
 /// universal-variable leak bug.
 ///
 /// Both sessions must share the same `XDG_CONFIG_HOME` (that's where fish's
@@ -316,7 +366,7 @@ echo "JOBS_P_COUNT:"(jobs -p 2>/dev/null | count)
 /// start B first (idle, polling), let it settle, then run A's refresh to
 /// completion while B is still alive, then join B.
 #[test]
-fn concurrent_sessions_do_not_leak_ready_variable_state() {
+fn concurrent_sessions_do_not_leak_repaint_variable_state() {
     let env = FishEnv::new();
     env.reset_cache();
 
@@ -336,18 +386,17 @@ fn concurrent_sessions_do_not_leak_ready_variable_state() {
 
     // Session B: sits idle in a polling loop (services fish's event loop so
     // it CAN receive uvar notifications if they leak) and logs any change to
-    // ANY __starship_async_ready_* variable, plus its own skip_fire state.
-    // It never calls __starship_fire_async itself.
+    // its own per-session poke variable. It never fires a watcher itself.
     let session_b_script = format!(
         r#"{source}
-echo "SESSION_B_OWN_VAR:$__starship_async_ready_var"
-function __probe_leak --on-variable $__starship_async_ready_var
-    echo "LEAK_HANDLER_FIRED value=$$__starship_async_ready_var" >> '{log}'
+echo "SESSION_B_OWN_VAR:$__starship_defer_var"
+function __probe_leak --on-variable $__starship_defer_var
+    echo "LEAK_HANDLER_FIRED value=$$__starship_defer_var" >> '{log}'
 end
 for i in (seq 1 50)
     sleep 0.05
 end
-echo "SESSION_B_FINAL_SKIP_FIRE:$__starship_async_skip_fire"
+echo SESSION_B_DONE
 "#,
         source = env.source_snippet(),
         log = session_b_log.display(),
@@ -360,13 +409,13 @@ echo "SESSION_B_FINAL_SKIP_FIRE:$__starship_async_skip_fire"
     std::thread::sleep(Duration::from_millis(500));
 
     // Session A: sources the init script, reads off the (per-session,
-    // randomized) ready-var name it assigned, then fires a real async
-    // refresh mid-way through session B's lifetime -- sharing the same
+    // pid-scoped) poke-var name it assigned, then fires a real refresh
+    // mid-way through session B's lifetime -- sharing the same
     // XDG_CONFIG_HOME (and thus the same universal variable file) but
     // otherwise a wholly separate fish process/session.
     let session_a_script = format!(
         r#"{source}
-echo "SESSION_A_OWN_VAR:$__starship_async_ready_var"
+echo "SESSION_A_OWN_VAR:$__starship_defer_var"
 {fire_and_wait}
 echo SESSION_A_BG_DONE
 "#,
@@ -389,31 +438,24 @@ echo SESSION_A_BG_DONE
         .lines()
         .find_map(|l| l.strip_prefix("SESSION_B_OWN_VAR:"))
         .unwrap_or_default();
-    let session_b_final_skip = session_b_stdout
-        .lines()
-        .find_map(|l| l.strip_prefix("SESSION_B_FINAL_SKIP_FIRE:"))
-        .unwrap_or_default();
 
     assert!(
         !session_a_var.is_empty() && !session_b_var.is_empty(),
-        "could not determine per-session ready-var names (A='{session_a_var}' B='{session_b_var}')"
+        "could not determine per-session poke-var names (A='{session_a_var}' B='{session_b_var}')"
     );
     assert_ne!(
         session_a_var, session_b_var,
-        "sessions ended up with the SAME ready-var name ('{session_a_var}') -- not isolated"
+        "sessions ended up with the SAME poke-var name ('{session_a_var}') -- not isolated"
     );
     assert!(
         leak_log_contents.trim().is_empty(),
         "session B's handler fired due to session A's refresh: {leak_log_contents}"
     );
-    assert_eq!(
-        session_b_final_skip, "0",
-        "session B's skip_fire was perturbed (expected '0'); full B output: '{session_b_stdout}'"
-    );
 }
 
-/// `STARSHIP_ASYNC=0` must reproduce the old fully synchronous behavior,
-/// with no async functions/handlers engaged and no background job fired.
+/// `STARSHIP_ASYNC=0` must reproduce the old fully synchronous behavior:
+/// no `--cached` flag installed, no handlers engaged, no watcher fired even
+/// through a real `fish_postexec`.
 #[test]
 fn starship_async_zero_disables_all_async_machinery() {
     let env = FishEnv::new();
@@ -421,12 +463,13 @@ fn starship_async_zero_disables_all_async_machinery() {
 
     let script = format!(
         r#"{}
-echo "EXPORTED:$STARSHIP_ASYNC"
-functions -q __starship_async_repaint; and echo 'HANDLER_DEFINED:yes'; or echo 'HANDLER_DEFINED:no'
-functions -q __starship_async_cleanup; and echo 'CLEANUP_DEFINED:yes'; or echo 'CLEANUP_DEFINED:no'
-functions -q __starship_tick_repaint; and echo 'TICK_HANDLER:yes'; or echo 'TICK_HANDLER:no'
+set -q __starship_cached; and echo 'CACHED_FLAG:set'; or echo 'CACHED_FLAG:unset'
+functions -q __starship_defer_repaint; and echo 'HANDLER_DEFINED:yes'; or echo 'HANDLER_DEFINED:no'
+functions -q __starship_defer_cleanup; and echo 'CLEANUP_DEFINED:yes'; or echo 'CLEANUP_DEFINED:no'
+functions -q __starship_defer_postexec; and echo 'POSTEXEC_DEFINED:yes'; or echo 'POSTEXEC_DEFINED:no'
 fish_prompt >/dev/null
-set -q __starship_async_pid; and echo 'FIRED:yes'; or echo 'FIRED:no'
+emit fish_postexec 'true'
+set -q __starship_defer_pid; and echo 'FIRED:yes'; or echo 'FIRED:no'
 "#,
         env.source_snippet()
     );
@@ -438,71 +481,29 @@ set -q __starship_async_pid; and echo 'FIRED:yes'; or echo 'FIRED:no'
     let mut out = String::from_utf8_lossy(&output.stdout).into_owned();
     out.push_str(&String::from_utf8_lossy(&output.stderr));
 
-    assert!(out.contains("EXPORTED:0"), "got: '{out}'");
+    assert!(out.contains("CACHED_FLAG:unset"), "got: '{out}'");
     assert!(out.contains("HANDLER_DEFINED:no"), "got: '{out}'");
     assert!(out.contains("CLEANUP_DEFINED:no"), "got: '{out}'");
+    assert!(out.contains("POSTEXEC_DEFINED:no"), "got: '{out}'");
     assert!(out.contains("FIRED:no"), "got: '{out}'");
-    // The live-update tick machinery is likewise part of the async block, so
-    // its per-session handler must not be engaged under STARSHIP_ASYNC=0.
-    assert!(out.contains("TICK_HANDLER:no"), "got: '{out}'");
-}
-
-/// The fish live-update tick primitive works end to end: arming it spawns a
-/// background sleep that, when the interval elapses, twiddles this session's
-/// per-session tick universal variable -- the signal whose `--on-variable`
-/// handler drives `commandline -f repaint` (a fast CacheRead redraw that
-/// advances a live module like `time`). Killing it clears the pid.
-#[test]
-fn live_tick_arm_fires_signal_and_kill_clears_it() {
-    let env = FishEnv::new();
-    let root = env.path().join("session_tick_fire");
-    std::fs::create_dir_all(&root).unwrap();
-    let tick_log = root.join("tick.log");
-    std::fs::write(&tick_log, "").unwrap();
-
-    let script = format!(
-        r#"{source}
-function __probe_tick --on-variable $__starship_tick_var
-    echo TICK_FIRED >> '{log}'
-end
-__starship_arm_tick 1
-set -q __starship_tick_pid; and echo 'ARMED:yes'; or echo 'ARMED:no'
-# Service the event loop long enough for the 1s sleep to elapse and deliver
-# the universal-variable notification (same idle-poll idiom as the leak test).
-for i in (seq 1 60)
-    sleep 0.05
-end
-__starship_kill_tick
-set -q __starship_tick_pid; and echo 'AFTER_KILL_PID:set'; or echo 'AFTER_KILL_PID:unset'
-"#,
-        source = env.source_snippet(),
-        log = tick_log.display(),
-    );
-    let out = env.run_in(&root, &script);
-    let fired = std::fs::read_to_string(&tick_log).unwrap_or_default();
-
-    assert!(
-        out.contains("ARMED:yes"),
-        "arming the tick did not set __starship_tick_pid; out: {out}"
-    );
-    assert!(
-        fired.contains("TICK_FIRED"),
-        "tick did not twiddle its repaint signal within ~3s; out: {out}"
-    );
-    assert!(
-        out.contains("AFTER_KILL_PID:unset"),
-        "the tick pid was not cleared after the tick fired/was killed; out: {out}"
+    // Direct mode never touches the cache either.
+    assert_eq!(
+        env.cache_file_count(),
+        0,
+        "STARSHIP_ASYNC=0 wrote cache entries"
     );
 }
 
-/// The tick is opt-in: `fish_prompt` only arms it when the configured
-/// `refresh_interval` is positive; with the default `0` it does not.
+/// The live-update tick lives inside the watcher (`--watch` + the configured
+/// `refresh_interval`), not in shell-side timers: with `refresh_interval = 0`
+/// the watcher exits right after its refresh poke, and with a positive value
+/// it stays alive ticking (poking the same variable) until killed.
 #[test]
-fn live_tick_armed_only_when_refresh_interval_positive() {
+fn watcher_lifetime_follows_refresh_interval() {
     let env = FishEnv::new();
 
-    for (interval, expect_armed) in [("0", false), ("1", true)] {
-        let root = env.path().join(format!("session_gate_{interval}"));
+    for (interval, expect_alive) in [("0", false), ("1", true)] {
+        let root = env.path().join(format!("session_tick_{interval}"));
         std::fs::create_dir_all(&root).unwrap();
         let cfg = root.join("starship.toml");
         std::fs::write(
@@ -510,32 +511,216 @@ fn live_tick_armed_only_when_refresh_interval_positive() {
             format!("refresh_interval = {interval}\nformat = \"$character\"\n"),
         )
         .unwrap();
+        let tick_log = root.join("tick.log");
+        std::fs::write(&tick_log, "").unwrap();
 
         let script = format!(
             r#"{source}
-set STARSHIP_CMD_STATUS 0
-set STARSHIP_CMD_PIPESTATUS 0
-set STARSHIP_KEYMAP insert
-set STARSHIP_DURATION 0
-set STARSHIP_JOBS 0
-fish_prompt >/dev/null
-set -q __starship_tick_pid; and echo 'TICK_ARMED:yes'; or echo 'TICK_ARMED:no'
-# Be a good citizen: tear down anything the prompt draw spawned.
-__starship_kill_tick
-set -q __starship_async_pid; and kill $__starship_async_pid 2>/dev/null
+function __probe_tick --on-variable $__starship_defer_var
+    echo TICKED >> '{log}'
+end
+set -g STARSHIP_CMD_STATUS 0
+set -g STARSHIP_CMD_PIPESTATUS 0
+set -g STARSHIP_KEYMAP insert
+set -g STARSHIP_DURATION 0
+set -g STARSHIP_JOBS 0
+__starship_defer
+# Service the event loop long enough for the refresh (fast: $character only)
+# and, when configured, at least one 1s tick to land.
+for i in (seq 1 50)
+    sleep 0.05
+end
+kill -0 $__starship_defer_pid 2>/dev/null; and echo 'WATCHER:alive'; or echo 'WATCHER:gone'
+__starship_defer_kill
+set -q __starship_defer_pid; and echo 'AFTER_KILL_PID:set'; or echo 'AFTER_KILL_PID:unset'
 "#,
             source = env.source_snippet(),
+            log = tick_log.display(),
         );
         let mut cmd = env.command_in(&root, &script);
         cmd.env("STARSHIP_CONFIG", &cfg);
         let output = cmd.output().expect("failed to run fish -c");
         let out = String::from_utf8_lossy(&output.stdout).into_owned()
             + &String::from_utf8_lossy(&output.stderr);
+        let ticks = std::fs::read_to_string(&tick_log).unwrap_or_default();
+        let poke_count = ticks.lines().filter(|l| l.contains("TICKED")).count();
 
-        let armed = out.contains("TICK_ARMED:yes");
-        assert_eq!(
-            armed, expect_armed,
-            "refresh_interval={interval}: expected tick armed={expect_armed}; out: {out}"
+        if expect_alive {
+            assert!(
+                out.contains("WATCHER:alive"),
+                "refresh_interval={interval}: watcher should stay alive ticking; out: '{out}'"
+            );
+            assert!(
+                poke_count >= 2,
+                "refresh_interval={interval}: expected the refresh poke plus at least one tick poke (saw {poke_count}); out: '{out}'"
+            );
+        } else {
+            assert!(
+                out.contains("WATCHER:gone"),
+                "refresh_interval={interval}: watcher should exit right after its refresh poke; out: '{out}'"
+            );
+        }
+        assert!(
+            out.contains("AFTER_KILL_PID:unset"),
+            "__starship_defer_kill did not clear the watcher pid; out: '{out}'"
         );
     }
+}
+
+/// Regression test for a real bug found in this exact rework: `__starship_defer`
+/// used to background its work as an inline `begin ... | while read ...; end &`
+/// block. Confirmed by direct testing that fish cannot actually kill that
+/// construct as a unit -- `kill $last_pid` on it is a no-op, so with a
+/// positive `refresh_interval` (a genuinely long-lived, ticking watcher) the
+/// underlying `starship prompt --deferred --watch` process leaked forever,
+/// once per command executed, never reaped by `__starship_defer_kill`. The
+/// fix launches a genuine external `fish -c` process instead (context passed
+/// via `env`), which fish CAN kill as a unit.
+///
+/// `AFTER_KILL_PID:unset` alone (checked in
+/// [`watcher_lifetime_follows_refresh_interval`]) does NOT catch this: fish
+/// clears its own `$__starship_defer_pid` bookkeeping variable regardless of
+/// whether the `kill` call actually terminated anything. This test instead
+/// polls the real OS process table (scoped by cwd, see
+/// `pids_matching_with_cwd_under`) for the real `starship prompt --deferred
+/// --watch` process and asserts it is actually gone after
+/// `__starship_defer_kill` -- proving the underlying process died, not just
+/// that fish's tracking variable was cleared.
+#[test]
+fn defer_kill_actually_terminates_the_watcher_process() {
+    let env = FishEnv::new();
+    let root = env.path().join("session_kill_terminates");
+    std::fs::create_dir_all(&root).unwrap();
+    let cfg = root.join("starship.toml");
+    // A positive refresh_interval makes the watcher genuinely long-lived
+    // (ticking forever until killed), which is exactly the case that leaked.
+    std::fs::write(&cfg, "refresh_interval = 1\nformat = \"$character\"\n").unwrap();
+
+    let script = format!(
+        r#"{source}
+set -g STARSHIP_CMD_STATUS 0
+set -g STARSHIP_CMD_PIPESTATUS 0
+set -g STARSHIP_KEYMAP insert
+set -g STARSHIP_DURATION 0
+set -g STARSHIP_JOBS 0
+__starship_defer
+# Let the refresh (and, since refresh_interval=1, at least the start of
+# ticking) actually begin before we try to kill it.
+for i in (seq 1 20)
+    sleep 0.05
+end
+__starship_defer_kill
+echo KILL_ISSUED
+"#,
+        source = env.source_snippet(),
+    );
+    let mut cmd = env.command_in(&root, &script);
+    cmd.env("STARSHIP_CONFIG", &cfg);
+    let output = cmd.output().expect("failed to run fish -c");
+    let out = String::from_utf8_lossy(&output.stdout).into_owned()
+        + &String::from_utf8_lossy(&output.stderr);
+    assert!(out.contains("KILL_ISSUED"), "script did not complete; out: '{out}'");
+
+    // The real watcher process is spawned with the fish session's cwd (see
+    // FishEnv::command_in), so it's scoped the same way other leak checks in
+    // this suite scope theirs.
+    let pattern = format!("{} prompt --deferred --watch", STARSHIP_BIN.display());
+
+    // Poll rather than assert instantly: even a correctly-killed process can
+    // take a moment to actually leave the process table. But it must be gone
+    // well within a couple of refresh_interval ticks -- if it's still there
+    // after that, __starship_defer_kill did not actually terminate it (the
+    // regression this test exists to catch), not merely "hasn't exited yet".
+    let deadline = Instant::now() + Duration::from_secs(5);
+    let mut alive = pids_matching_with_cwd_under(&pattern, &root);
+    while !alive.is_empty() && Instant::now() < deadline {
+        std::thread::sleep(Duration::from_millis(200));
+        alive = pids_matching_with_cwd_under(&pattern, &root);
+    }
+    assert!(
+        alive.is_empty(),
+        "__starship_defer_kill did not actually terminate the watcher process: still running: {alive:?}"
+    );
+}
+
+/// Regression test for a real bug reported by a user: `__starship_defer`
+/// spawns its watcher via `env ... fish -c '...'`, which requires a bare
+/// `fish` to resolve through `$PATH`. That is not a given -- e.g. `nix run
+/// nixpkgs#fish` does not necessarily put `fish` itself on `$PATH` for child
+/// processes -- and when it fails to resolve, `env` errors out silently (no
+/// error surfaces to the user) and the watcher simply never starts: the cache
+/// never gets populated or refreshed, and nothing ever updates. The fix
+/// resolves the *currently running* fish's own absolute path via
+/// `$__fish_bin_dir` (a long-standing internal fish variable) instead of
+/// relying on `$PATH` at all, so this must work even when a bare `fish`
+/// cannot be found.
+#[test]
+fn defer_starts_even_when_plain_fish_is_not_on_path() {
+    let env = FishEnv::new();
+    env.reset_cache();
+
+    let root = env.path().join("session_no_fish_on_path");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let script = format!(
+        r#"{source}
+# Simulate a shell where a bare `fish` does not resolve via $PATH (as with
+# `nix run nixpkgs#fish`, which was the real report this test guards
+# against), while keeping the tools the *test* itself still needs.
+set -gx PATH /usr/bin /bin
+set -g STARSHIP_CMD_STATUS 0
+set -g STARSHIP_CMD_PIPESTATUS 0
+set -g STARSHIP_KEYMAP insert
+set -g STARSHIP_DURATION 0
+set -g STARSHIP_JOBS 0
+__starship_defer
+set -l p $__starship_defer_pid
+while kill -0 $p 2>/dev/null
+    sleep 0.02
+end
+echo DONE
+"#,
+        source = env.source_snippet(),
+    );
+    // Resolve the real fish binary's absolute path *before* restricting
+    // $PATH below, and launch it directly by that path -- `command_in` uses
+    // `Command::new("fish")`, which itself needs to find fish via $PATH, so
+    // reusing it here (with a restricted child PATH) would risk failing to
+    // launch the outer session at all rather than testing the real scenario
+    // (the outer fish already running; only the *bare `fish` lookup made
+    // from inside that session* -- by `__starship_defer` -- should fail).
+    let fish_path = Command::new("command")
+        .args(["-v", "fish"])
+        .output()
+        .ok()
+        .filter(|o| o.status.success())
+        .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
+        .filter(|p| !p.is_empty())
+        .expect("could not resolve a real fish binary to launch for this test");
+
+    let mut cmd = Command::new(fish_path);
+    cmd.arg("-c").arg(&script);
+    cmd.current_dir(&root);
+    for (k, v) in FishEnv::isolated_envs(&root) {
+        cmd.env(k, v);
+    }
+    cmd.env("STARSHIP_CONFIG", &env.scratch.config_path);
+    cmd.env("STARSHIP_CACHE", &env.scratch.cache_path);
+    let output = cmd.output().expect("failed to run fish -c");
+    let out = String::from_utf8_lossy(&output.stdout).into_owned()
+        + &String::from_utf8_lossy(&output.stderr);
+
+    // "DONE" alone would also print if the watcher failed to spawn at all
+    // (fish just wouldn't have set $__starship_defer_pid, so `kill -0 $p`
+    // fails immediately and the loop "completes" trivially) -- the cache
+    // actually being populated is the real proof that the watcher process
+    // was spawned, ran the deferred refresh to completion, and exited on
+    // its own, which is only possible if `env ... "$__fish_bin_dir/fish" -c`
+    // successfully resolved and launched fish despite the restricted $PATH.
+    assert!(out.contains("DONE"), "script did not complete; out: '{out}'");
+    assert!(
+        env.cache_file_count() > 0,
+        "the watcher never populated the cache when a bare `fish` was not on $PATH -- \
+         __starship_defer must resolve fish via $__fish_bin_dir, not $PATH; out: '{out}'"
+    );
 }

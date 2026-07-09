@@ -136,13 +136,12 @@ pub fn handle<'a>(module: &str, context: &'a Context) -> Option<Module<'a>> {
     let start: Instant = Instant::now();
 
     let mode = cache::exec_mode();
-    let key = cache::module_key(module, &context.current_dir);
 
     // Fast async paint: replay any output the last refresh recorded for this
     // module. Only slow modules are ever recorded, so fast ones fall through
     // and render live.
     if mode == ExecMode::CacheRead
-        && let Some(text) = cache::read::<String>(&key)
+        && let Some(text) = cache::lookup(module, &context.current_dir)
     {
         let mut m = context.new_module(module);
         m.set_segments(crate::segment::Segment::from_text(None, text));
@@ -292,7 +291,7 @@ pub fn handle<'a>(module: &str, context: &'a Context) -> Option<Module<'a>> {
         && elapsed >= SLOW_MODULE_THRESHOLD
         && let Some(m) = &m
     {
-        cache::write(&key, &module_to_string(m));
+        cache::record(module, module_to_string(m));
     }
 
     m

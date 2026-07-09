@@ -1,21 +1,25 @@
-import uuid
+import subprocess
 import threading
+import time
+import uuid
 
 
-# Enable Starship's async/cache mode by default so that plain `prompt` calls are
-# treated as fast "cache read" paints and `--async` calls perform full refreshes +
-# cache writes. Only default when unset -- respect an explicit STARSHIP_ASYNC=0
-# (or any falsy value) set by the user as an opt-out that falls back to the old,
-# fully-synchronous single-call-per-prompt behavior.
-$STARSHIP_ASYNC = ${...}.get('STARSHIP_ASYNC', '1')
-_STARSHIP_ASYNC_ENABLED = $STARSHIP_ASYNC not in ('0', '', None)
+# Async prompt (opt out with STARSHIP_ASYNC=0):
+#   * $PROMPT/$RIGHT_PROMPT return the last published render instantly.
+#   * After each prompt, one background `starship prompt --deferred --watch`
+#     recomputes both prompts and rewrites the on-disk cache, then prints one
+#     line per repaint this session should do: one when the refresh lands,
+#     then one per configured `refresh_interval` tick so dynamic modules
+#     (e.g. `time`) keep advancing while the prompt sits idle. A reader
+#     thread turns each line into fresh --cached paints (slow modules served
+#     from the cache) plus a prompt_toolkit invalidate().
+_STARSHIP_ASYNC = ${...}.get('STARSHIP_ASYNC', '1') not in ('0', '', None)
 
 # Thread-safe storage for the latest fully rendered prompt segments.
-# The prompt functions return these instantly; background threads + invalidate()
-# keep them up to date without blocking prompt rendering.
 _STARSHIP_LEFT = ''
 _STARSHIP_RIGHT = ''
 _STARSHIP_LOCK = threading.Lock()
+_STARSHIP_PROC = None
 
 
 def _starship_jobs():
@@ -24,44 +28,47 @@ def _starship_jobs():
     return sum(1 for job in __xonsh__.all_jobs.values() if job['obj'] and job['obj'].poll() is None)
 
 
-def _starship_cmd_info():
-    """Extract status, jobs and cmd duration from history for the *previous* command."""
+def _starship_args(extra):
+    """Starship argv with status, jobs and duration of the *previous* command."""
     last_cmd = __xonsh__.history[-1] if __xonsh__.history else None
     status = last_cmd.rtn if last_cmd else 0
-    jobs = _starship_jobs()
     duration = round((last_cmd.ts[1] - last_cmd.ts[0]) * 1000) if last_cmd else 0
-    return status, jobs, duration
-
-
-def _starship_refresh(right=False, use_async=True):
-    """Invoke Starship and return the rendered prompt (str).
-    use_async=True  -> appends --async so Starship runs in ExecMode::Refresh (full compute + cache write)
-    use_async=False -> plain call; when $STARSHIP_ASYNC=1 this becomes a fast CacheRead paint.
-    """
-    status, jobs, duration = _starship_cmd_info()
-    args = [
+    return [
         "::STARSHIP::",
         "prompt",
         f"--status={status}",
-        f"--jobs={jobs}",
+        f"--jobs={_starship_jobs()}",
         f"--cmd-duration={duration}",
+        *extra,
     ]
+
+
+def _starship_paint(right=False):
+    """Render a prompt synchronously. With async on this is a fast --cached
+    paint; otherwise it is the classic direct render. Runs plain subprocess
+    (with xonsh's exported env) so it is safe from any thread."""
+    extra = ["--cached"] if _STARSHIP_ASYNC else []
     if right:
-        args.append("--right")
-    if use_async:
-        args.append("--async")
+        extra.append("--right")
     try:
-        out = __xonsh__.subproc_captured_stdout(args)
-        return out
+        return subprocess.run(
+            _starship_args(extra),
+            capture_output=True, text=True, env=__xonsh__.env.detype(),
+        ).stdout
     except Exception:
         return ''
 
 
-def _starship_invalidate():
-    """Thread-safe request to prompt_toolkit to redraw the prompt.
-    This is the key to showing the updated (full) prompt after the background
-    thread finishes, without the user having to press a key.
-    """
+def _starship_publish():
+    """Recompute both paints, publish them, and ask prompt_toolkit to redraw.
+    invalidate() is prompt_toolkit's thread-safe redraw request; it no-ops
+    when no app is active (e.g. while a command is running)."""
+    global _STARSHIP_LEFT, _STARSHIP_RIGHT
+    left = _starship_paint()
+    right = _starship_paint(right=True)
+    with _STARSHIP_LOCK:
+        _STARSHIP_LEFT = left
+        _STARSHIP_RIGHT = right
     try:
         # Xonsh ptk shell nests as: __xonsh__.shell.shell.prompter.app
         prompter = __xonsh__.shell.shell.prompter
@@ -73,106 +80,112 @@ def _starship_invalidate():
         pass
 
 
-def _starship_worker():
-    """Background worker: compute fresh left + right prompts and publish them."""
+def _starship_reader(proc):
+    """One poke line from the watcher = one repaint (refresh landed or a
+    live-update tick elapsed). Ends when the watcher exits.
+
+    Uses an explicit `readline()` loop rather than `for line in proc.stdout`:
+    confirmed by direct testing that plain iteration over a `Popen` pipe does
+    not reliably yield each line promptly when the writer trickles output
+    slowly (one poke per `refresh_interval` second here) -- the iterator's
+    own internal read-ahead buffering can withhold an already-available line
+    until more data arrives, silently stalling the tick. `bufsize=1` (below,
+    at the Popen call) plus `readline()` is the standard fix for this exact
+    class of "slow producer" pipe-reading bug.
+    """
     try:
-        left = _starship_refresh(right=False, use_async=True)
-        right = _starship_refresh(right=True, use_async=True)
-        global _STARSHIP_LEFT, _STARSHIP_RIGHT
-        with _STARSHIP_LOCK:
-            _STARSHIP_LEFT = left
-            _STARSHIP_RIGHT = right
-        _starship_invalidate()
+        for _ in iter(proc.stdout.readline, ''):
+            _starship_publish()
     except Exception:
-        # Never let background errors affect the shell or future prompts
+        # Never let background errors affect the shell or future prompts.
         pass
 
 
+# Minimum real time between two watcher (re)launches. xonsh's own
+# prompt-cycle bookkeeping fires `on_pre_prompt` several times in quick
+# succession around a single logical input line -- not just once per actual
+# "one command, one prompt" cycle (confirmed by direct experimentation; see
+# `resize_does_not_refire_on_pre_prompt` in the test suite for this file).
+# `len(__xonsh__.history)` is NOT a reliable guard against this: it was
+# previously used on the theory that these extra firings were "spurious" and
+# would show an unchanged history length, but direct tracing showed the
+# opposite -- history length genuinely increments on each of these rapid
+# firings too (e.g. once per statement in a pasted/compound input), so that
+# guard let every one of them through. Each pass-through kills and relaunches
+# the watcher, and the resulting overlapping `--deferred` processes contend
+# for CPU; that contention was observed to make otherwise-fast, never-cached
+# modules (e.g. `time`) occasionally cross the async refresh's slow-module
+# threshold, permanently freezing them in the cache until the next full
+# refresh (see `src/cache.rs`, `SLOW_MODULE_THRESHOLD` in
+# `src/modules/mod.rs`) -- the frozen-clock bug this guards against.
+#
+# A wall-clock debounce sidesteps the unreliable history-length signal
+# entirely: real, separate command prompts are always at least this far
+# apart in interactive use, while a burst of same-instant refires collapses
+# into a single relaunch.
+_STARSHIP_DEBOUNCE_SECONDS = 0.2
+_STARSHIP_LAST_LAUNCH = 0.0
+
+
 def _starship_on_pre_prompt(**kwargs):
-    """Hook that triggers an async refresh for the *next* prompt display.
-    Started on every pre-prompt so that slow modules (git status in huge repos etc.)
-    are computed off the UI thread.
+    """Replace any in-flight watcher with a fresh one carrying the finished
+    command's context -- but only when enough wall-clock time has passed
+    since the last (re)launch, so a burst of same-instant `on_pre_prompt`
+    refires collapses into a single relaunch instead of repeatedly killing
+    and restarting the watcher (see module docstring above for why that
+    matters: overlapping watchers contend for CPU and can freeze fast
+    modules stale).
     """
-    # Fire-and-forget daemon thread. Multiple overlapping threads are harmless;
-    # the last one to finish wins and will call invalidate().
-    t = threading.Thread(target=_starship_worker, daemon=True)
-    t.start()
+    global _STARSHIP_PROC, _STARSHIP_LAST_LAUNCH
+    now = time.monotonic()
+    if _STARSHIP_PROC is not None and (now - _STARSHIP_LAST_LAUNCH) < _STARSHIP_DEBOUNCE_SECONDS:
+        return
+    _STARSHIP_LAST_LAUNCH = now
 
-
-def _starship_refresh_interval():
-    """Configured `refresh_interval` (whole seconds; 0 = disabled), read once."""
-    try:
-        return int(__xonsh__.subproc_captured_stdout(
-            ["::STARSHIP::", "refresh-interval"]
-        ).strip())
-    except Exception:
-        return 0
-
-
-def _starship_ticker(interval):
-    """Live-update tick: while the user sits at the prompt, recompute the prompt
-    every `interval` seconds via a fast CacheRead call (fast modules like `time`
-    recompute live; slow ones are served from cache -- no `--async` refresh) and
-    ask prompt_toolkit to redraw, so the clock advances with no keypress.
-    """
-    import time as _time
-    while True:
-        _time.sleep(interval)
+    if _STARSHIP_PROC is not None:
         try:
-            left = _starship_refresh(right=False, use_async=False)
-            right = _starship_refresh(right=True, use_async=False)
-            global _STARSHIP_LEFT, _STARSHIP_RIGHT
-            with _STARSHIP_LOCK:
-                _STARSHIP_LEFT = left
-                _STARSHIP_RIGHT = right
-            _starship_invalidate()
+            _STARSHIP_PROC.terminate()
         except Exception:
-            # Never let a background tick affect the shell or future prompts.
             pass
-
-
-if _STARSHIP_ASYNC_ENABLED:
-    events.on_pre_prompt(_starship_on_pre_prompt)
-    # Start the live-update ticker if enabled. It's a persistent daemon thread
-    # (prompt_toolkit's invalidate() no-ops when no app is active, e.g. while a
-    # command runs), so no per-prompt arming/cancelling is needed.
-    _starship_interval = _starship_refresh_interval()
-    if _starship_interval > 0:
-        threading.Thread(
-            target=_starship_ticker, args=(_starship_interval,), daemon=True
-        ).start()
+    try:
+        _STARSHIP_PROC = subprocess.Popen(
+            _starship_args(["--deferred", "--watch"]),
+            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
+            bufsize=1,
+            env=__xonsh__.env.detype(),
+        )
+    except Exception:
+        _STARSHIP_PROC = None
+        return
+    threading.Thread(target=_starship_reader, args=(_STARSHIP_PROC,), daemon=True).start()
 
 
 def starship_prompt():
-    """$PROMPT function. Returns the last known rendered left prompt instantly.
-    Falls back to a (fast) synchronous call only on the very first prompt.
-    When async mode is disabled (STARSHIP_ASYNC=0), always performs the classic
-    fully-synchronous single call per prompt -- no background thread involved.
-    """
-    if _STARSHIP_ASYNC_ENABLED:
+    """$PROMPT function. Returns the last published left prompt instantly.
+    Falls back to a synchronous paint on the very first prompt, or always
+    when async is disabled."""
+    if _STARSHIP_ASYNC:
         with _STARSHIP_LOCK:
             if _STARSHIP_LEFT:
                 return _STARSHIP_LEFT
-    # First paint, no value yet, or async disabled: perform a direct call
-    # (CacheRead if STARSHIP_ASYNC is enabled, plain Direct render otherwise).
-    return _starship_refresh(right=False, use_async=False)
+    return _starship_paint()
 
 
 def starship_rprompt():
-    """$RIGHT_PROMPT function. Same semantics as starship_prompt for the right side."""
-    if _STARSHIP_ASYNC_ENABLED:
+    """$RIGHT_PROMPT function. Same semantics as starship_prompt."""
+    if _STARSHIP_ASYNC:
         with _STARSHIP_LOCK:
             if _STARSHIP_RIGHT:
                 return _STARSHIP_RIGHT
-    return _starship_refresh(right=True, use_async=False)
+    return _starship_paint(right=True)
 
 
-if _STARSHIP_ASYNC_ENABLED:
-    # Initial synchronous paint so the *very first* prompt the user sees is never
-    # empty. Uses a non-async call so it is treated as the fast path.
+if _STARSHIP_ASYNC:
+    events.on_pre_prompt(_starship_on_pre_prompt)
+    # Initial synchronous paint so the *very first* prompt is never empty.
     try:
-        _STARSHIP_LEFT = _starship_refresh(right=False, use_async=False)
-        _STARSHIP_RIGHT = _starship_refresh(right=True, use_async=False)
+        _STARSHIP_LEFT = _starship_paint()
+        _STARSHIP_RIGHT = _starship_paint(right=True)
     except Exception:
         pass
 

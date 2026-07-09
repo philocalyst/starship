@@ -133,10 +133,22 @@ enum Commands {
         /// Print the continuation prompt (instead of the standard left prompt)
         #[clap(long, conflicts_with = "right", conflicts_with = "profile")]
         continuation: bool,
-        /// Render slow modules in the background and record them, so the shell
-        /// can redraw the prompt with them once ready (used for async prompts)
-        #[clap(long = "async")]
-        async_refresh: bool,
+        /// Serve slow modules from the cache written by the last `--deferred`
+        /// refresh instead of recomputing them (the fast paint of the async
+        /// prompt; uncached modules still render live)
+        #[clap(long, conflicts_with_all = ["profile", "continuation"])]
+        cached: bool,
+        /// Recompute every module for both prompts in the background and
+        /// record the slow ones for later `--cached` paints. Prints one line
+        /// once the cache is fresh so the shell knows to repaint
+        #[clap(long, conflicts_with_all = ["right", "profile", "continuation", "cached"])]
+        deferred: bool,
+        /// After the deferred refresh, keep printing one line per configured
+        /// `refresh_interval` so the shell can repaint dynamic modules while
+        /// the prompt sits idle (exits when the interval is 0 or the shell
+        /// stops listening)
+        #[clap(long, requires = "deferred")]
+        watch: bool,
         #[clap(flatten)]
         properties: Properties,
     },
@@ -154,10 +166,6 @@ enum Commands {
     /// Prints time in milliseconds
     #[clap(hide = true)]
     Time,
-    /// Prints how often (in whole seconds) the shell should repaint the prompt
-    /// to keep live modules updating; `0` means live updates are disabled.
-    #[clap(hide = true)]
-    RefreshInterval,
     /// Prints timings of all active modules
     Timings(Properties),
     /// Toggle a given starship module
@@ -237,9 +245,24 @@ fn main() {
             right,
             profile,
             continuation,
-            async_refresh,
+            cached,
+            deferred,
+            watch,
         } => {
-            configure_async_prompt(async_refresh);
+            use starship::cache::{self, ExecMode};
+
+            if deferred {
+                // The background half of the async prompt: render both
+                // prompts, record the slow modules, and poke the shell to
+                // repaint (see `print::deferred`).
+                cache::set_exec_mode(ExecMode::Refresh);
+                print::deferred(properties, watch);
+                return;
+            }
+
+            if cached {
+                cache::set_exec_mode(ExecMode::CacheRead);
+            }
             let target = match (right, profile, continuation) {
                 (true, _, _) => Target::Right,
                 (_, Some(profile_name), _) => Target::Profile(profile_name),
@@ -297,9 +320,6 @@ fn main() {
                 None => println!("{}", -1),
             }
         }
-        Commands::RefreshInterval => {
-            println!("{}", Context::default().root_config.refresh_interval);
-        }
         Commands::Explain(props) => print::explain(props),
         Commands::Timings(props) => print::timings(props),
         Commands::Completions { shell } => generate_completions(shell),
@@ -325,33 +345,6 @@ fn main() {
         }
         #[cfg(feature = "config-schema")]
         Commands::ConfigSchema => print::print_schema(),
-    }
-}
-
-/// Select the execution mode for this prompt render.
-///
-/// Async prompting is enabled by the shell (see the `init` scripts) via the
-/// `STARSHIP_ASYNC` environment variable. When it is set, a plain
-/// `starship prompt` is the fast paint that serves slow work from the cache,
-/// and `starship prompt --async` is the background refresh that recomputes and
-/// records it (its output is captured by the shell to redraw). When unset,
-/// every prompt renders directly, exactly as before.
-fn configure_async_prompt(async_refresh: bool) {
-    use starship::cache::{self, ExecMode};
-
-    let async_enabled =
-        std::env::var_os("STARSHIP_ASYNC").is_some_and(|v| v != "0" && !v.is_empty());
-    let mode = match (async_enabled, async_refresh) {
-        (true, true) => ExecMode::Refresh,
-        (true, false) => ExecMode::CacheRead,
-        (false, _) => ExecMode::Direct,
-    };
-    cache::set_exec_mode(mode);
-
-    // Prune stale entries from abandoned directories as the refresh writes new
-    // ones, like log cleanup.
-    if mode == ExecMode::Refresh && cache::cache_enabled() {
-        rayon::spawn(cache::cleanup);
     }
 }
 
