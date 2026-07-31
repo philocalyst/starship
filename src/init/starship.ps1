@@ -53,7 +53,7 @@ $null = New-Module starship {
         }
         $process = [System.Diagnostics.Process]::Start($startInfo)
 
-        # Fire-and-forget mode (used for the background --deferred refresh):
+        # Fire-and-forget mode (used for the background refresh):
         # don't wait for or read the output. The process's whole effect is the
         # cache it writes; its single poke line fits comfortably in the
         # redirected pipe's buffer, so it exits cleanly without a reader.
@@ -163,10 +163,10 @@ $null = New-Module starship {
             }
         } else {
             if ($script:UseAsync) {
-                # Instant --cached paint, then a fire-and-forget --deferred
+                # Instant --fast paint, then a fire-and-forget
                 # refresh that rewrites the cache for the next draw.
-                $p = Invoke-Native -Executable ::STARSHIP:: -Arguments ($arguments + "--cached")
-                Invoke-Native -Executable ::STARSHIP:: -Arguments ($arguments + "--deferred") -NoWait
+                $p = Invoke-Native -Executable ::STARSHIP:: -Arguments ($arguments + "--fast")
+                Invoke-Native -Executable ::STARSHIP:: -Arguments (@("refresh") + $arguments[1..($arguments.Length - 1)]) -NoWait
                 $p
             } else {
                 Invoke-Native -Executable ::STARSHIP:: -Arguments $arguments
@@ -219,8 +219,8 @@ $null = New-Module starship {
     $ENV:STARSHIP_SESSION_KEY = -join ((48..57) + (65..90) + (97..122) | Get-Random -Count 16 | ForEach-Object { [char]$_ })
 
     # Async prompt (opt out with STARSHIP_ASYNC=0): the prompt function paints
-    # with --cached (slow modules served from the on-disk cache) and fires one
-    # fire-and-forget `starship prompt --deferred` (see Invoke-Native -NoWait)
+    # with --fast (slow modules served from the on-disk cache) and fires one
+    # fire-and-forget `starship refresh` (see Invoke-Native -NoWait)
     # that recomputes both prompts and rewrites that cache.
     #
     # PowerShell cannot safely repaint an already-drawn prompt from the
@@ -230,7 +230,7 @@ $null = New-Module starship {
     # 7.7-preview/macOS; PSReadLine/PSReadLine#1092 reports the same class of
     # issue). So the refreshed values appear on the *next* prompt draw --
     # never stale, never wrong, just not repainted in place -- and the
-    # `refresh_interval` live-update setting is a no-op here (--deferred runs
+    # `refresh_interval` live-update setting is a no-op here (refresh runs
     # without --watch).
     $script:UseAsync = [string]::IsNullOrEmpty($env:STARSHIP_ASYNC) -or ($env:STARSHIP_ASYNC -ne "0")
 

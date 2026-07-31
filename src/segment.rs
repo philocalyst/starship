@@ -3,10 +3,11 @@ use crate::{
     print::{Grapheme, UnicodeWidthGraphemes},
 };
 use nu_ansi_term::{AnsiString, Style as AnsiStyle};
+use serde::{Deserialize, Serialize};
 use unicode_segmentation::UnicodeSegmentation;
 
 /// Type that holds text with an associated style
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct TextSegment {
     /// The segment's style. If None, will inherit the style of the module containing it.
     style: Option<Style>,
@@ -26,7 +27,7 @@ impl TextSegment {
 }
 
 /// Type that holds fill text with an associated style
-#[derive(Clone)]
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub struct FillSegment {
     /// The segment's style. If None, will inherit the style of the module containing it.
     style: Option<Style>,
@@ -87,7 +88,13 @@ mod fill_seg_tests {
 }
 
 /// A segment is a styled text chunk ready for printing.
-#[derive(Clone)]
+///
+/// `Serialize`/`Deserialize` exist so that a completed render can be kept
+/// between prompts *as structure* — see [`crate::prompt::store`]. Persisting
+/// finished ANSI instead would bake terminal width, palette resolution, and
+/// shell escaping into the stored value, none of which are knowable at the time
+/// a module is computed in the background.
+#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
 pub enum Segment {
     Text(TextSegment),
     Fill(FillSegment),

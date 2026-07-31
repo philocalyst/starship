@@ -101,43 +101,50 @@ PROMPT='$('::STARSHIP::' prompt --terminal-width="$COLUMNS" --keymap="${KEYMAP:-
 RPROMPT='$('::STARSHIP::' prompt --right --terminal-width="$COLUMNS" --keymap="${KEYMAP:-}" --status="${STARSHIP_CMD_STATUS:-}" --pipestatus="${STARSHIP_PIPE_STATUS[*]:-}" --cmd-duration="${STARSHIP_DURATION:-}" --jobs="$STARSHIP_JOBS_COUNT")'
 PROMPT2="$(::STARSHIP:: prompt --continuation)"
 
-# Async prompt (opt out with STARSHIP_ASYNC=0). Two pieces:
-#   1. PROMPT/RPROMPT run `starship prompt --cached`: an instant paint that
-#      serves slow modules (git status, ...) from the cache maintained by the
-#      background refresh, and computes the fast ones live.
-#   2. precmd launches a single background `starship prompt --deferred
-#      --watch`, which recomputes everything (both sides), rewrites the cache,
-#      and then prints one line per repaint this shell should do: one when the
-#      refresh lands, then one per configured `refresh_interval` tick so
-#      dynamic modules (e.g. `time`) keep advancing while the prompt sits
-#      idle. A single zle -F callback turns each of those lines into
-#      reset-prompt, which re-runs the --cached paint from step 1.
+# Incremental prompt (opt out with STARSHIP_ASYNC=0). Two pieces:
+#   1. PROMPT/RPROMPT run `starship prompt --fast`: it reuses every module
+#      whose recorded observations still hold, shows the last known value for
+#      any that have lapsed, and computes the cheap, per-invocation ones (the
+#      character, exit status, job count) live. It never waits on expensive
+#      work.
+#   2. precmd launches one background `starship refresh`, which recomputes
+#      exactly what has lapsed -- not the whole prompt -- records it, and
+#      prints one line per repaint this shell should perform. A single `zle -F`
+#      callback turns each line into `reset-prompt`, which re-runs the fast
+#      paint from step 1.
+#
+# `refresh` stays silent when the recomputed prompt is identical to what was
+# already stored, so a quiet directory does not repaint once per command.
+#
+# STARSHIP_WATCHMAN=1 lets cache reads ask an already-running Facebook Watchman
+# instance whether its recorded filesystem clock advanced. The shell does not
+# run or subscribe to Watchman; unavailable Watchman falls back to dependency
+# stamps without affecting the prompt.
 if [[ ${STARSHIP_ASYNC:-1} != 0 ]]; then
-    PROMPT='$('::STARSHIP::' prompt --cached --terminal-width="$COLUMNS" --keymap="${KEYMAP:-}" --status="${STARSHIP_CMD_STATUS:-}" --pipestatus="${STARSHIP_PIPE_STATUS[*]:-}" --cmd-duration="${STARSHIP_DURATION:-}" --jobs="$STARSHIP_JOBS_COUNT")'
-    RPROMPT='$('::STARSHIP::' prompt --cached --right --terminal-width="$COLUMNS" --keymap="${KEYMAP:-}" --status="${STARSHIP_CMD_STATUS:-}" --pipestatus="${STARSHIP_PIPE_STATUS[*]:-}" --cmd-duration="${STARSHIP_DURATION:-}" --jobs="$STARSHIP_JOBS_COUNT")'
+    PROMPT='$('::STARSHIP::' prompt --fast --terminal-width="$COLUMNS" --keymap="${KEYMAP:-}" --status="${STARSHIP_CMD_STATUS:-}" --pipestatus="${STARSHIP_PIPE_STATUS[*]:-}" --cmd-duration="${STARSHIP_DURATION:-}" --jobs="$STARSHIP_JOBS_COUNT")'
+    RPROMPT='$('::STARSHIP::' prompt --fast --right --terminal-width="$COLUMNS" --keymap="${KEYMAP:-}" --status="${STARSHIP_CMD_STATUS:-}" --pipestatus="${STARSHIP_PIPE_STATUS[*]:-}" --cmd-duration="${STARSHIP_DURATION:-}" --jobs="$STARSHIP_JOBS_COUNT")'
 
-    typeset -g _STARSHIP_DEFER_FD=0 _STARSHIP_DEFER_PID=0
+    typeset -g _STARSHIP_REFRESH_FD=0 _STARSHIP_REFRESH_PID=0
 
-    # Stop the current watcher: detach its callback, close its pipe, kill it.
-    _starship_defer_cancel() {
-        (( _STARSHIP_DEFER_FD )) || return 0
-        zle -F "$_STARSHIP_DEFER_FD" 2>/dev/null
-        exec {_STARSHIP_DEFER_FD}<&- 2>/dev/null
-        (( _STARSHIP_DEFER_PID )) && kill "$_STARSHIP_DEFER_PID" 2>/dev/null
-        _STARSHIP_DEFER_FD=0 _STARSHIP_DEFER_PID=0
+    # Stop the current refresher: detach its callback, close its pipe, kill it.
+    _starship_refresh_cancel() {
+        (( _STARSHIP_REFRESH_FD )) || return 0
+        zle -F "$_STARSHIP_REFRESH_FD" 2>/dev/null
+        exec {_STARSHIP_REFRESH_FD}<&- 2>/dev/null
+        (( _STARSHIP_REFRESH_PID )) && kill "$_STARSHIP_REFRESH_PID" 2>/dev/null
+        _STARSHIP_REFRESH_FD=0 _STARSHIP_REFRESH_PID=0
     }
 
-    # One poke line from the watcher = one repaint (the refresh landed, or a
-    # live-update tick elapsed).
-    _starship_defer_callback() {
+    # One line from the refresher = one repaint.
+    _starship_refresh_callback() {
         local fd=$1 _poke
         if ! IFS= read -r -u "$fd" _poke 2>/dev/null; then
-            # EOF: the watcher exited (refresh_interval is 0, or it was
-            # killed). Detach without kill -- the process is already gone.
+            # EOF: the refresher finished (nothing more to announce) or was
+            # killed. Detach without kill -- the process is already gone.
             zle -F "$fd" 2>/dev/null
             exec {fd}<&- 2>/dev/null
-            if (( fd == _STARSHIP_DEFER_FD )); then
-                _STARSHIP_DEFER_FD=0 _STARSHIP_DEFER_PID=0
+            if (( fd == _STARSHIP_REFRESH_FD )); then
+                _STARSHIP_REFRESH_FD=0 _STARSHIP_REFRESH_PID=0
             fi
             return 0
         fi
@@ -148,22 +155,21 @@ if [[ ${STARSHIP_ASYNC:-1} != 0 ]]; then
         fi
     }
 
-    # precmd: replace any in-flight watcher with a fresh one carrying this
+    # precmd: replace any in-flight refresher with a fresh one carrying this
     # command's context.
-    _starship_defer_start() {
-        _starship_defer_cancel
-        exec {_STARSHIP_DEFER_FD}< <(::STARSHIP:: prompt --deferred --watch \
+    _starship_refresh_start() {
+        _starship_refresh_cancel
+        exec {_STARSHIP_REFRESH_FD}< <(::STARSHIP:: refresh \
             --terminal-width="$COLUMNS" \
             --keymap="${KEYMAP:-}" \
             --status="${STARSHIP_CMD_STATUS:-}" \
             --pipestatus="${STARSHIP_PIPE_STATUS[*]:-}" \
             --cmd-duration="${STARSHIP_DURATION:-}" \
             --jobs="$STARSHIP_JOBS_COUNT")
-        _STARSHIP_DEFER_PID=$!
-        zle -F "$_STARSHIP_DEFER_FD" _starship_defer_callback
+        _STARSHIP_REFRESH_PID=$!
+        zle -F "$_STARSHIP_REFRESH_FD" _starship_refresh_callback
     }
 
-    add-zsh-hook precmd _starship_defer_start
-    add-zsh-hook zshexit _starship_defer_cancel
+    add-zsh-hook precmd _starship_refresh_start
+    add-zsh-hook zshexit _starship_refresh_cancel
 fi
-

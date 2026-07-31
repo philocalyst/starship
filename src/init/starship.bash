@@ -78,9 +78,9 @@ starship_precmd() {
         STARSHIP_START_TIME=""
     fi
 
-    # Async prompt (opt out with STARSHIP_ASYNC=0): paint with --cached (slow
+    # Async prompt (opt out with STARSHIP_ASYNC=0): paint with --fast (slow
     # modules served from the cache) and fire one fire-and-forget background
-    # `starship prompt --deferred` to refresh that cache for both prompts.
+    # `starship refresh` to update that cache for both prompts.
     # Plain Bash cannot repaint an already-drawn prompt (readline won't
     # re-expand PS1 mid-line), so the refreshed values appear on the next
     # prompt draw -- and for the same reason the `refresh_interval`
@@ -88,12 +88,12 @@ starship_precmd() {
     # backgrounded refresh out of this shell's job table entirely (no
     # job-control notifications, no effect on the NUM_JOBS count above), and
     # its poke output is discarded.
-    # $starship_paint word-splits to --cached when async is on, nothing when off.
+    # $starship_paint word-splits to --fast when async is on, nothing when off.
     local starship_paint=
-    [[ ${STARSHIP_ASYNC:-1} != 0 ]] && starship_paint=--cached
+    [[ ${STARSHIP_ASYNC:-1} != 0 ]] && starship_paint=--fast
     PS1="$(::STARSHIP:: prompt $starship_paint "${ARGS[@]}")"
     if [[ -n $starship_paint ]]; then
-        ( ::STARSHIP:: prompt --deferred "${ARGS[@]}" & ) >/dev/null 2>&1
+        ( ::STARSHIP:: refresh "${ARGS[@]}" & ) >/dev/null 2>&1
     fi
     if [[ ${BLE_ATTACHED-} ]]; then
         local nlns=${PS1//[!$'\n']}
@@ -167,4 +167,3 @@ export STARSHIP_SESSION_KEY=${STARSHIP_SESSION_KEY:0:16}; # Trim to 16-digits if
 
 # Set the continuation prompt
 PS2="$(::STARSHIP:: prompt --continuation)"
-

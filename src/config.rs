@@ -267,13 +267,13 @@ where
     })
 }
 
-#[derive(Clone, Copy, Debug, PartialEq)]
+#[derive(Clone, Copy, Debug, PartialEq, Serialize, Deserialize)]
 enum PrevColor {
     Fg,
     Bg,
 }
 
-#[derive(Clone, Copy, Debug, Default, PartialEq)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Serialize, Deserialize)]
 /// Wrapper for `nu_ansi_term::Style` that supports referencing the previous style's foreground/background color.
 pub struct Style {
     style: nu_ansi_term::Style,

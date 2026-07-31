@@ -13,9 +13,6 @@ use std::sync::LazyLock;
 use std::sync::Once;
 use tempfile::TempDir;
 
-#[cfg(unix)]
-pub mod init_async;
-
 static FIXTURE_DIR: LazyLock<PathBuf> =
     LazyLock::new(|| PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("src/test/fixtures/"));
 

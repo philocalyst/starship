@@ -113,40 +113,100 @@ mod typst;
 #[cfg(feature = "battery")]
 pub use self::battery::{BatteryInfoProvider, BatteryInfoProviderImpl};
 
-use crate::cache::{self, ExecMode};
 use crate::config::ModuleConfig;
 use crate::context::{Context, Detected, Shell};
 use crate::module::Module;
-use nu_ansi_term::AnsiStrings;
-use std::time::{Duration, Instant};
+use crate::prompt::{Envelope, Profile, Store};
+use std::time::Instant;
 
-/// Modules that take at least this long are recorded by the async refresh, so
-/// the next fast paint can replay them instead of recomputing. Faster modules
-/// (the character, exit status, ...) are always computed live so they stay
-/// current.
-const SLOW_MODULE_THRESHOLD: Duration = Duration::from_millis(5);
+/// Render a module, reusing previous work where that is provably safe.
+///
+/// The decision is made entirely from the module's declared [`Profile`], not
+/// from how long it happened to take. Measuring duration answered the wrong
+/// question: it identified what was *expensive*, and then reused it as though
+/// expense implied *stability*. The two are unrelated, which is how a `custom`
+/// module -- reliably slow, frequently volatile -- ended up cached under a key
+/// that could not see it change, while a fast machine could silently stop
+/// caching a genuinely stable module altogether.
+///
+/// Three profiles, three paths:
+///
+/// * [`Profile::Live`] -- always computed. Nothing is stored and nothing is
+///   reused, because the answer belongs to this invocation.
+/// * [`Profile::Keyed`] -- reused while its observations hold, and otherwise
+///   computed or deferred according to the render's policy.
+/// * [`Profile::Sampled`] -- never reused, but the last reading may be shown
+///   while a fresh one is taken.
+pub fn handle<'a>(module: &str, context: &'a Context) -> Option<Module<'a>> {
+    // The profile differs in exactly one respect -- on what terms a result may
+    // be kept -- so it is resolved to that one question up front and the rest of
+    // the flow is shared. `Live` is the only profile that leaves entirely.
+    let keying = match crate::prompt::profile(module) {
+        Profile::Live => return compute(module, context),
+        Profile::Keyed(keying) => Some(keying),
+        Profile::Sampled => None,
+    };
 
-/// The module's fully rendered text, suitable for caching and later replay as a
-/// single pre-styled segment.
-fn module_to_string(m: &Module) -> String {
-    AnsiStrings(&m.ansi_strings()).to_string()
+    let envelope = envelope_for(module, context);
+
+    // A sampled module can never satisfy this: its entry is recorded as
+    // `SampleOnly`, which `Snapshot::get` refuses. It can still be *shown*
+    // from here when the policy accepts a previous reading.
+    if let Some(resolved) = context.render.reuse(module, &envelope) {
+        return replay(module, context, resolved);
+    }
+
+    // Observed *before* computing, so the record describes the world the module
+    // is about to read. Observing afterwards would pin state the render never
+    // saw, and a change landing mid-render would then be captured as though it
+    // had been accounted for -- invisible instead of invalidating.
+    let deps = keying.map(|keying| keying.observe(context));
+    let computed = compute(module, context);
+
+    if let Some(rendered) = &computed {
+        let segments = rendered.segments.clone();
+        context.render.record(
+            module,
+            match deps {
+                Some(deps) => Store::keyed(envelope, deps, segments),
+                None => Store::sample(envelope, segments),
+            },
+        );
+    }
+    computed
 }
 
-pub fn handle<'a>(module: &str, context: &'a Context) -> Option<Module<'a>> {
-    let start: Instant = Instant::now();
+/// Ambient invalidators for one module: the binary, and the module's own
+/// configuration subtree.
+fn envelope_for(module: &str, context: &Context) -> Envelope {
+    Envelope::new(
+        crate::shadow::PKG_VERSION,
+        Envelope::hash_config(context.config.get_module_config(module)),
+    )
+}
 
-    let mode = cache::exec_mode();
-
-    // Fast async paint: replay any output the last refresh recorded for this
-    // module. Only slow modules are ever recorded, so fast ones fall through
-    // and render live.
-    if mode == ExecMode::CacheRead
-        && let Some(text) = cache::lookup(module, &context.current_dir)
-    {
-        let mut m = context.new_module(module);
-        m.set_segments(crate::segment::Segment::from_text(None, text));
-        return Some(m);
+/// Rebuild a module from stored segments.
+///
+/// The segments go back exactly as they were computed -- styled spans, not
+/// flattened text -- so width-aware fill, palette resolution, and shell escaping
+/// all still apply downstream. Replaying pre-rendered ANSI instead is what made
+/// a reused module opaque to every one of those.
+fn replay<'a>(
+    module: &str,
+    context: &'a Context,
+    resolved: crate::prompt::Resolved,
+) -> Option<Module<'a>> {
+    if resolved.segments.is_empty() {
+        return None;
     }
+    let mut m = context.new_module(module);
+    m.set_segments(resolved.segments);
+    Some(m)
+}
+
+/// Run the module itself.
+fn compute<'a>(module: &str, context: &'a Context) -> Option<Module<'a>> {
+    let start: Instant = Instant::now();
 
     let mut m: Option<Module> = {
         match module {
@@ -284,16 +344,6 @@ pub fn handle<'a>(module: &str, context: &'a Context) -> Option<Module<'a>> {
         m.get_or_insert_with(|| context.new_module(module)).duration = elapsed;
     }
 
-    // Record slow modules during the refresh so the next fast paint can replay
-    // them. The presence of a cache entry is itself the "this module is slow"
-    // signal, so fast modules are never served stale.
-    if mode == ExecMode::Refresh
-        && elapsed >= SLOW_MODULE_THRESHOLD
-        && let Some(m) = &m
-    {
-        cache::record(module, module_to_string(m));
-    }
-
     m
 }
 
@@ -427,20 +477,51 @@ mod test {
     }
 
     #[test]
-    fn cached_text_replays_identically() {
-        // The dispatcher caches a slow module's rendered text and later replays
-        // it as a single pre-styled segment (see `handle`). That round-trip must
-        // be byte-identical, so serving a module from the cache looks exactly
-        // like computing it.
-        use crate::segment::Segment;
-        let context = crate::test::default_context();
+    fn a_live_module_is_never_recorded() {
+        // `character` describes this invocation, so recording it would give a
+        // later paint something it must not reuse. The dispatcher's `Live` arm
+        // returns before any store interaction at all -- this pins that, since
+        // a stray record here would be invisible until a prompt showed the
+        // wrong keymap or exit status.
+        let mut context = crate::test::default_context();
+        context.render = crate::prompt::Render::new(
+            crate::prompt::RenderPolicy::Refresh,
+            crate::prompt::Snapshot::default(),
+        );
 
-        let mut original = context.new_module("directory");
-        original.set_segments(Segment::from_text(None, "\u{1b}[34m~/code\u{1b}[0m on "));
-        let text = module_to_string(&original);
+        let _ = handle("character", &context);
 
-        let mut replayed = context.new_module("directory");
-        replayed.set_segments(Segment::from_text(None, text.clone()));
-        assert_eq!(module_to_string(&replayed), text);
+        assert!(
+            context.render.take_recorded().is_empty(),
+            "a module whose input arrives with the invocation must leave \
+             nothing behind for a later paint to pick up",
+        );
+    }
+
+    #[test]
+    fn a_keyed_module_records_the_observations_it_was_computed_under() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut context = crate::test::default_context();
+        context.current_dir = dir.path().to_path_buf();
+        context.render = crate::prompt::Render::new(
+            crate::prompt::RenderPolicy::Refresh,
+            crate::prompt::Snapshot::default(),
+        );
+
+        // `package` is keyed on the directory and renders nothing in an empty
+        // one; what matters is that when it does render, the entry carries
+        // observations rather than a bare blob of text.
+        let _ = handle("package", &context);
+        let recorded = context.render.take_recorded();
+
+        for name in ["package"] {
+            if let Some(entry) = recorded.get_stale(name) {
+                assert!(
+                    !entry.deps().is_empty(),
+                    "{name} was stored without anything to invalidate it, which \
+                     would make it reusable forever",
+                );
+            }
+        }
     }
 }

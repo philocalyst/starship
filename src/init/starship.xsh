@@ -6,12 +6,12 @@ import uuid
 
 # Async prompt (opt out with STARSHIP_ASYNC=0):
 #   * $PROMPT/$RIGHT_PROMPT return the last published render instantly.
-#   * After each prompt, one background `starship prompt --deferred --watch`
+#   * After each prompt, one background `starship refresh --watch`
 #     recomputes both prompts and rewrites the on-disk cache, then prints one
 #     line per repaint this session should do: one when the refresh lands,
 #     then one per configured `refresh_interval` tick so dynamic modules
 #     (e.g. `time`) keep advancing while the prompt sits idle. A reader
-#     thread turns each line into fresh --cached paints (slow modules served
+#     thread turns each line into fresh --fast paints (slow modules served
 #     from the cache) plus a prompt_toolkit invalidate().
 _STARSHIP_ASYNC = ${...}.get('STARSHIP_ASYNC', '1') not in ('0', '', None)
 
@@ -28,14 +28,14 @@ def _starship_jobs():
     return sum(1 for job in __xonsh__.all_jobs.values() if job['obj'] and job['obj'].poll() is None)
 
 
-def _starship_args(extra):
+def _starship_args(extra, command="prompt"):
     """Starship argv with status, jobs and duration of the *previous* command."""
     last_cmd = __xonsh__.history[-1] if __xonsh__.history else None
     status = last_cmd.rtn if last_cmd else 0
     duration = round((last_cmd.ts[1] - last_cmd.ts[0]) * 1000) if last_cmd else 0
     return [
         "::STARSHIP::",
-        "prompt",
+        command,
         f"--status={status}",
         f"--jobs={_starship_jobs()}",
         f"--cmd-duration={duration}",
@@ -44,10 +44,10 @@ def _starship_args(extra):
 
 
 def _starship_paint(right=False):
-    """Render a prompt synchronously. With async on this is a fast --cached
+    """Render a prompt synchronously. With async on this is a --fast
     paint; otherwise it is the classic direct render. Runs plain subprocess
     (with xonsh's exported env) so it is safe from any thread."""
-    extra = ["--cached"] if _STARSHIP_ASYNC else []
+    extra = ["--fast"] if _STARSHIP_ASYNC else []
     if right:
         extra.append("--right")
     try:
@@ -112,7 +112,7 @@ def _starship_reader(proc):
 # opposite -- history length genuinely increments on each of these rapid
 # firings too (e.g. once per statement in a pasted/compound input), so that
 # guard let every one of them through. Each pass-through kills and relaunches
-# the watcher, and the resulting overlapping `--deferred` processes contend
+# the watcher, and the resulting overlapping `refresh` processes contend
 # for CPU; that contention was observed to make otherwise-fast, never-cached
 # modules (e.g. `time`) occasionally cross the async refresh's slow-module
 # threshold, permanently freezing them in the cache until the next full
@@ -149,7 +149,7 @@ def _starship_on_pre_prompt(**kwargs):
             pass
     try:
         _STARSHIP_PROC = subprocess.Popen(
-            _starship_args(["--deferred", "--watch"]),
+            _starship_args(["--watch"], command="refresh"),
             stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True,
             bufsize=1,
             env=__xonsh__.env.detype(),

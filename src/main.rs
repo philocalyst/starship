@@ -133,21 +133,24 @@ enum Commands {
         /// Print the continuation prompt (instead of the standard left prompt)
         #[clap(long, conflicts_with = "right", conflicts_with = "profile")]
         continuation: bool,
-        /// Serve slow modules from the cache written by the last `--deferred`
-        /// refresh instead of recomputing them (the fast paint of the async
-        /// prompt; uncached modules still render live)
+        /// Paint without waiting for expensive modules: reuse what is still
+        /// valid, show the last known value for what is not, and let a
+        /// background `starship refresh` fill in the rest
         #[clap(long, conflicts_with_all = ["profile", "continuation"])]
-        cached: bool,
-        /// Recompute every module for both prompts in the background and
-        /// record the slow ones for later `--cached` paints. Prints one line
-        /// once the cache is fresh so the shell knows to repaint
-        #[clap(long, conflicts_with_all = ["right", "profile", "continuation", "cached"])]
-        deferred: bool,
-        /// After the deferred refresh, keep printing one line per configured
-        /// `refresh_interval` so the shell can repaint dynamic modules while
-        /// the prompt sits idle (exits when the interval is 0 or the shell
-        /// stops listening)
-        #[clap(long, requires = "deferred")]
+        fast: bool,
+        #[clap(flatten)]
+        properties: Properties,
+    },
+    /// Recompute what the last paint could not, and print one line per repaint
+    /// the shell should perform
+    ///
+    /// Run once per command, in the background. Each line of output means
+    /// "repaint now"; the shell repaints by re-running its own `prompt --fast`,
+    /// so this never needs to hand back prompt text. Exits when the shell stops
+    /// reading.
+    Refresh {
+        /// Keep emitting repaint requests at the configured refresh interval.
+        #[clap(long)]
         watch: bool,
         #[clap(flatten)]
         properties: Properties,
@@ -245,31 +248,30 @@ fn main() {
             right,
             profile,
             continuation,
-            cached,
-            deferred,
-            watch,
+            fast,
         } => {
-            use starship::cache::{self, ExecMode};
-
-            if deferred {
-                // The background half of the async prompt: render both
-                // prompts, record the slow modules, and poke the shell to
-                // repaint (see `print::deferred`).
-                cache::set_exec_mode(ExecMode::Refresh);
-                print::deferred(properties, watch);
-                return;
-            }
-
-            if cached {
-                cache::set_exec_mode(ExecMode::CacheRead);
-            }
             let target = match (right, profile, continuation) {
                 (true, _, _) => Target::Right,
                 (_, Some(profile_name), _) => Target::Profile(profile_name),
                 (_, _, true) => Target::Continuation,
                 (_, _, _) => Target::Main,
             };
+
+            if fast {
+                let store = starship::prompt::Store::default_location();
+                // The provisional list is discarded here on purpose: the paint
+                // process is about to exit, and the background `refresh` will
+                // work out what is missing for itself by re-observing. Passing
+                // it along would be an optimization that has to be kept correct
+                // in two places.
+                let _ = print::paint(properties, target, &store);
+                return;
+            }
+
             print::prompt(properties, target);
+        }
+        Commands::Refresh { properties, watch } => {
+            print::refresh_and_poke(properties, watch);
         }
         Commands::Module {
             name,

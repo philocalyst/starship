@@ -9,7 +9,6 @@ shadow!(shadow);
 
 // Lib is present to allow for benchmarking
 pub mod bug_report;
-pub mod cache;
 pub mod config;
 pub mod configs;
 pub mod configure;
@@ -20,7 +19,8 @@ pub mod logger;
 pub mod module;
 mod modules;
 pub mod print;
-mod segment;
+pub mod prompt;
+pub mod segment;
 mod utils;
 
 #[cfg(test)]

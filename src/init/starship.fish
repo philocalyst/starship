@@ -11,13 +11,13 @@ function __starship_set_job_count --description 'Set STARSHIP_JOBS using fish jo
 end
 
 function __starship_defer --description 'Launch the background refresh/live-update watcher'
-    # One background `starship prompt --deferred --watch`: it recomputes both
-    # prompts, rewrites the on-disk cache the --cached paints read, then
+    # One background `starship refresh --watch`: it recomputes both prompts,
+    # rewrites the on-disk cache the --fast paints read, then
     # prints one line per repaint this session should do -- one when the
     # refresh lands, then one per configured `refresh_interval` tick so
     # dynamic modules (e.g. `time`) keep advancing while the prompt sits
     # idle. Each line twiddles a per-session universal variable; the
-    # --on-variable handler repaints, re-running fish_prompt's --cached paint.
+    # --on-variable handler repaints, re-running fish_prompt's --fast paint.
     #
     # The variable is scoped by this session's PID (see $__starship_defer_var
     # below): universal variables are shared by every fish process on the
@@ -28,7 +28,7 @@ function __starship_defer --description 'Launch the background refresh/live-upda
     # shell. Confirmed by direct testing: backgrounding a `begin...end` block
     # that contains a pipe does not let fish kill the whole unit -- `kill` on
     # its reported pid is a no-op, so with `refresh_interval > 0` the ticking
-    # `starship --deferred --watch` process (and the `while read` consuming
+    # `starship refresh --watch` process (and the `while read` consuming
     # it) leaks forever, once per command run, and is never reaped. A plain
     # external process backgrounded with `&` does not have this problem:
     # killing it actually terminates it, which closes its read end of the
@@ -53,7 +53,7 @@ function __starship_defer --description 'Launch the background refresh/live-upda
         STARSHIP_JOBS="$STARSHIP_JOBS" \
         STARSHIP_DEFER_VAR="$__starship_defer_var" \
         "$__fish_bin_dir/fish" -c '
-            ::STARSHIP:: prompt --deferred --watch \
+            ::STARSHIP:: refresh --watch \
                 --terminal-width="$COLUMNS" \
                 --status="$STARSHIP_CMD_STATUS" \
                 --pipestatus="$STARSHIP_CMD_PIPESTATUS" \
@@ -102,7 +102,7 @@ function fish_prompt
             printf "\e[1;32m❯\e[0m "
         end
     else
-        # $__starship_cached expands to --cached when async is on (see below)
+        # $__starship_cached expands to --fast when async is on (see below)
         # and to nothing when it's off, so this line covers both modes.
         ::STARSHIP:: prompt $__starship_cached --terminal-width="$COLUMNS" --status=$STARSHIP_CMD_STATUS --pipestatus="$STARSHIP_CMD_PIPESTATUS" --keymap=$STARSHIP_KEYMAP --cmd-duration=$STARSHIP_DURATION --jobs=$STARSHIP_JOBS
     end
@@ -208,12 +208,12 @@ function disable_transience --description 'remove transient prompt keybindings'
 end
 
 # Async prompt (opt out with STARSHIP_ASYNC=0): the prompt functions above do
-# an instant --cached paint, and a single background watcher (__starship_defer)
+# an instant --fast paint, and a single background watcher (__starship_defer)
 # refreshes the cache and pokes this session to repaint.
 if test "$STARSHIP_ASYNC" != "0"
-    # Make every fast paint a --cached render (slow modules served from the
+    # Make every fast paint a --fast render (slow modules served from the
     # cache the background watcher maintains).
-    set -g __starship_cached --cached
+    set -g __starship_cached --fast
 
     # Universal variables are broadcast to every fish process on the machine,
     # not just this session, so the watcher's repaint signal is scoped to a
@@ -228,7 +228,7 @@ if test "$STARSHIP_ASYNC" != "0"
 
     function __starship_defer_repaint --on-variable $__starship_defer_var
         # The watcher poked: repaint, so the prompt functions re-run their
-        # --cached paints and pick up the refreshed cache (or advance dynamic
+        # --fast paints and pick up the refreshed cache (or advance dynamic
         # modules on a tick). Never repaint over an active transient prompt.
         if test "$TRANSIENT" = "1"; or test "$RIGHT_TRANSIENT" = "1"
             return

@@ -83,6 +83,15 @@ pub struct Context<'a> {
     /// Starship root config
     pub root_config: StarshipRootConfig,
 
+    /// Reuse, recording, and provenance for this one prompt.
+    ///
+    /// Carried here rather than in a global so that a single process can render
+    /// under more than one policy -- which is what lets one background pass
+    /// serve both the left and right prompts from one set of gathered facts,
+    /// instead of building a second `Context` and paying for the configuration,
+    /// canonicalization, and repository discovery all over again.
+    pub render: crate::prompt::Render,
+
     /// Claude Code session data (when running as statusline)
     pub claude_code_data: Option<Box<ClaudeCodeData>>,
 
@@ -187,6 +196,7 @@ impl<'a> Context<'a> {
             #[cfg(feature = "battery")]
             battery_info_provider: &crate::modules::BatteryInfoProviderImpl,
             root_config,
+            render: crate::prompt::Render::default(),
             claude_code_data: None,
             _marker: PhantomData,
         }
@@ -961,6 +971,9 @@ pub enum Target {
 }
 
 /// Properties as passed on from the shell as arguments
+///
+/// A background render receives the exact context of the command that just ran;
+/// guessing it would report the wrong exit status or duration.
 #[derive(Parser, Clone, Debug)]
 pub struct Properties {
     /// The status code of the previously run command as an unsigned or signed 32bit integer

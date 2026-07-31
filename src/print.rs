@@ -1,4 +1,4 @@
-use clap::{builder::PossibleValue, ValueEnum};
+use clap::{ValueEnum, builder::PossibleValue};
 use nu_ansi_term::AnsiStrings;
 use rayon::prelude::*;
 use regex::Regex;
@@ -15,9 +15,10 @@ use unicode_width::UnicodeWidthChar;
 use crate::configs::PROMPT_ORDER;
 use crate::context::{Context, Properties, Shell, Target};
 use crate::formatter::{StringFormatter, VariableHolder};
-use crate::module::Module;
 use crate::module::ALL_MODULES;
+use crate::module::Module;
 use crate::modules;
+use crate::prompt::{Render, RenderPolicy, Store};
 use crate::segment::Segment;
 use crate::shadow;
 use crate::utils::wrap_colorseq_for_shell;
@@ -70,44 +71,101 @@ fn test_grapheme_aware_width() {
 }
 
 pub fn prompt(args: Properties, target: Target) {
-    let context = Context::new(args, target);
+    // Synchronous paints share the same cache lifecycle as async ones: valid
+    // entries are reused, but anything not proved current is computed before
+    // returning. This makes direct use faster without weakening its complete
+    // output guarantee.
+    let store = Store::default_location();
+    let context = incremental(args, target, RenderPolicy::Complete, &store);
     let stdout = io::stdout();
     let mut handle = stdout.lock();
 
     write!(handle, "{}", get_prompt(&context)).unwrap();
 }
 
-/// The background half of the async prompt (`starship prompt --deferred`).
+/// Paint a prompt without waiting for anything expensive.
 ///
-/// Renders both prompts with every module computed live, which — in
-/// [`crate::cache::ExecMode::Refresh`] — records the slow ones. The rendered
-/// text itself is discarded: the cache is the transport, and the shell
-/// repaints by re-running its fast `--cached` paint.
+/// Reuses every module whose observations still hold, shows the previous
+/// reading for those that have lapsed, and omits what has never been computed.
+/// Returns the modules that were provisional — empty means the paint was
+/// complete and no refresh is warranted, which is what lets an idle prompt cost
+/// nothing at all.
+pub fn paint(args: Properties, target: Target, store: &Store) -> Vec<String> {
+    let context = incremental(args, target, RenderPolicy::Immediate, store);
+
+    let stdout = io::stdout();
+    let mut handle = stdout.lock();
+    write!(handle, "{}", get_prompt(&context)).unwrap();
+
+    context.render.provisional()
+}
+
+/// Recompute what has lapsed and record the result.
 ///
-/// Once the cache is fresh, one "poke" line is printed so the shell knows to
-/// repaint. With `watch`, a further poke follows every configured
-/// `refresh_interval` seconds so dynamic modules (e.g. `time`) keep advancing
-/// while the prompt sits idle; ticks recompute nothing here — the shell's
-/// `--cached` repaint recomputes the fast modules and replays the slow ones.
-/// The process exits when the interval is 0 or the shell stops listening
-/// (poke writes fail once the pipe closes).
-pub fn deferred(args: Properties, watch: bool) {
-    let context = Context::new(args.clone(), Target::Main);
-    let interval = context.root_config.refresh_interval;
-    let dir = context.current_dir.clone();
+/// Renders both the left and the right prompt from a *single* [`Context`].
+/// That is the point of the function: the configuration is parsed once, the
+/// working directory canonicalized once, and the repository discovered once,
+/// with both renders drawing on the same warm [`OnceLock`]s. The previous
+/// design built a second `Context` for the right prompt and paid all three
+/// again, in the same process, for the same directory.
+///
+/// The rendered text is discarded. The store is the transport: a shell repaints
+/// by re-running its own fast paint, so handing back a string here would only
+/// create a second, redundant way for the prompt to arrive.
+///
+/// Returns whether anything actually changed, so a caller can avoid poking a
+/// shell into repainting an identical prompt.
+///
+/// [`OnceLock`]: std::sync::OnceLock
+pub fn refresh(args: Properties, store: &Store) -> bool {
+    let mut context = incremental(args, Target::Main, RenderPolicy::Refresh, store);
+    // A clock taken before rendering is only attached after a second query
+    // proves no event arrived during the render. That ordering prevents a file
+    // save racing a refresh from being hidden behind a newer clock.
+    let watchman_checkpoint = crate::prompt::watchman::checkpoint(
+        &context.current_dir,
+        crate::prompt::watchman::Budget::Refresh,
+    );
 
     let _ = get_prompt(&context);
+    context.target = Target::Right;
+    let _ = get_prompt(&context);
+
+    let mut recorded = context.render.take_recorded();
+    if watchman_checkpoint.as_ref().is_some_and(|checkpoint| {
+        crate::prompt::watchman::changes(checkpoint, crate::prompt::watchman::Budget::Refresh)
+            == Some(crate::prompt::watchman::ChangeSet::Clean)
+    }) {
+        recorded.set_watchman_checkpoint(watchman_checkpoint);
+    }
+    let changed = !recorded.matches(context.render.previous());
+
+    if let Err(error) = store.save(&context.current_dir, &recorded) {
+        log::debug!("Could not record prompt snapshot: {error}");
+    }
+    changed
+}
+
+/// Refresh the cache and notify an async shell when the visible prompt changed.
+///
+/// This is deliberately adjacent to [`prompt`], [`paint`], and [`refresh`]:
+/// all four calls use the same renderer and differ only in whether they may
+/// wait and whether they persist the result. There is no second async render
+/// implementation to keep in sync.
+pub fn refresh_and_poke(properties: Properties, watch: bool) {
+    let context = Context::new(properties.clone(), Target::Main);
+    let interval = context.root_config.refresh_interval;
     drop(context);
-    let _ = get_prompt(&Context::new(args, Target::Right));
 
-    crate::cache::flush(&dir);
-    // Prune snapshots of abandoned directories while we're here, like log
-    // cleanup.
-    crate::cache::cleanup();
-
-    if !poke() || !watch || interval == 0 {
+    let store = Store::default_location();
+    if refresh(properties, &store) && !poke() {
         return;
     }
+
+    if !watch || interval == 0 {
+        return;
+    }
+
     loop {
         std::thread::sleep(Duration::from_secs(interval));
         if !poke() {
@@ -116,13 +174,27 @@ pub fn deferred(args: Properties, watch: bool) {
     }
 }
 
-/// Tell the shell to repaint. Returns whether anyone is still listening.
-fn poke() -> bool {
+/// Tell a shell to repaint. A bare newline keeps the async transport separate
+/// from prompt rendering and shell representation.
+pub fn poke() -> bool {
     let mut stdout = io::stdout();
     stdout
         .write_all(b"\n")
         .and_then(|()| stdout.flush())
         .is_ok()
+}
+
+/// Build a context that participates in incremental rendering.
+fn incremental<'a>(
+    args: Properties,
+    target: Target,
+    policy: RenderPolicy,
+    store: &Store,
+) -> Context<'a> {
+    let mut context = Context::new(args, target);
+    let previous = store.load(&context.current_dir);
+    context.render = Render::new(policy, previous);
+    context
 }
 
 pub fn prompt_with_claude_code(args: Properties, target: Target) {

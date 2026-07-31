@@ -22,16 +22,16 @@ fn starship-after-command-hook {|m|
 set edit:after-command = [ $@edit:after-command $starship-after-command-hook~ ]
 
 # Async prompt (opt out with STARSHIP_ASYNC=0): the prompt closures below do
-# instant --cached paints (slow modules served from the on-disk cache), and
-# after each command one background `starship prompt --deferred` recomputes
+# instant --fast paints (slow modules served from the on-disk cache), and
+# after each command one background `starship refresh` recomputes
 # both prompts and rewrites that cache; `edit:redraw &full` then re-evaluates
 # the closures so they pick up the fresh values.
 #
-# $-starship-paint splices to --cached when async is on, to nothing when off.
+# $-starship-paint splices to --fast when async is on, to nothing when off.
 var -starship-paint = []
 
 if (not-eq $E:STARSHIP_ASYNC '0') {
-    set -starship-paint = [--cached]
+    set -starship-paint = [--fast]
 
     # Suppress the "job ... finished" notification for background refreshes.
     # This must be set globally (not via `tmp` inside the hook below): `tmp`
@@ -49,10 +49,10 @@ if (not-eq $E:STARSHIP_ASYNC '0') {
     # cancelled -- it's left to finish on its own. That is safe: the cache is
     # written atomically (temp file + rename), so an overlapping refresh can
     # only be superseded by a newer one, never corrupt the cache. The poke
-    # line `--deferred` prints is discarded; the redraw below is the repaint
+    # line `refresh` prints is discarded; the redraw below is the repaint
     # signal here.
     fn -starship-defer-job {|jobs-count cmd-duration status-code logical-path|
-        ::STARSHIP:: prompt --deferred --jobs=$jobs-count --cmd-duration=$cmd-duration --status=$status-code --logical-path=$logical-path >/dev/null
+        ::STARSHIP:: refresh --jobs=$jobs-count --cmd-duration=$cmd-duration --status=$status-code --logical-path=$logical-path >/dev/null
         edit:redraw &full=$true
     }
 
@@ -77,7 +77,7 @@ set edit:rprompt = {
 }
 
 # Live-update tick (root `refresh_interval`): not wired for Elvish, so the
-# refresh above runs `--deferred` without `--watch`. A periodic repaint would
+# refresh above runs without `--watch`. A periodic repaint would
 # need the prompt *content* to be recomputed while the editor sits idle, but
 # Elvish evaluates the prompt closures once per edit cycle and `edit:redraw
 # &full` reuses that result mid-cycle (verified: the clock stays frozen until
