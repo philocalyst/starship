@@ -199,9 +199,13 @@ pub fn profile(module: &str) -> Profile {
         // Claude Code's data arrives on stdin, so it is as fresh as the call.
         "claude_context" | "claude_cost" | "claude_model" => Live,
 
-        // ---- Sampled: costly, and with nothing observable that would prove a
-        // previous reading still true.
-        "battery" | "memory_usage" | "sudo" => Sampled,
+        // ---- Sampled: costly, or backed by user-wide state Starship cannot
+        // observe precisely enough to certify a cache entry. The latter group
+        // often takes an environment variable naming a profile, but also reads
+        // credentials or SDK files outside the project tree. Keying on that
+        // variable alone would replay a changed config as current.
+        "battery" | "memory_usage" | "sudo" | "aws" | "azure" | "gcloud" | "openstack"
+        | "kubernetes" | "docker_context" | "nats" | "spack" => Sampled,
 
         // ---- Version control.
         "git_branch" | "git_commit" | "git_metrics" | "git_state" | "git_status" | "hg_branch"
@@ -209,22 +213,9 @@ pub fn profile(module: &str) -> Profile {
             Keyed(Repo)
         }
 
-        // ---- Environment-steered context modules.
-        "aws" => Keyed(Env(&[
-            "AWS_PROFILE",
-            "AWS_REGION",
-            "AWS_DEFAULT_REGION",
-            "AWS_CONFIG_FILE",
-            "AWS_SHARED_CREDENTIALS_FILE",
-            "AWSU_PROFILE",
-            "AWS_VAULT",
-            "AWSUME_PROFILE",
-        ])),
-        "azure" => Keyed(Env(&["AZURE_CONFIG_DIR"])),
-        "gcloud" => Keyed(Env(&["CLOUDSDK_CONFIG", "CLOUDSDK_ACTIVE_CONFIG_NAME"])),
-        "openstack" => Keyed(Env(&["OS_CLOUD"])),
-        "kubernetes" => Keyed(All(&[Dir, Env(&["KUBECONFIG"])])),
-        "docker_context" => Keyed(All(&[Dir, Env(&["DOCKER_CONTEXT", "DOCKER_HOST"])])),
+        // ---- Environment-steered context modules. The modules backed by
+        // user-wide config files are sampled above; these are functions of
+        // process-local environment and project-tree state only.
         "conda" => Keyed(Env(&["CONDA_DEFAULT_ENV", "CONDA_PREFIX"])),
         "nix_shell" => Keyed(Env(&["IN_NIX_SHELL", "NIX_SHELL_PACKAGES", "name"])),
         "guix_shell" => Keyed(Env(&["GUIX_ENVIRONMENT"])),
@@ -232,11 +223,9 @@ pub fn profile(module: &str) -> Profile {
             Toolchain(&["direnv"]),
             Env(&["DIRENV_FILE", "DIRENV_DIR"]),
         ])),
-        "nats" => Keyed(Env(&["XDG_CONFIG_HOME"])),
         "terraform" => Keyed(All(&[Toolchain(&["terraform"]), Env(&["TF_WORKSPACE"])])),
         "pulumi" => Keyed(All(&[Toolchain(&["pulumi"]), Env(&["PULUMI_HOME"])])),
         "vagrant" => Keyed(Toolchain(&["vagrant"])),
-        "spack" => Keyed(Env(&["SPACK_ENV"])),
         "mise" => Keyed(Toolchain(&["mise"])),
         "pixi" => Keyed(All(&[
             Toolchain(&["pixi"]),
@@ -332,7 +321,22 @@ mod tests {
         let unclassified: Vec<_> = ALL_MODULES
             .iter()
             .filter(|m| profile(m) == Profile::Sampled)
-            .filter(|m| !matches!(**m, "battery" | "memory_usage" | "sudo"))
+            .filter(|m| {
+                !matches!(
+                    **m,
+                    "aws"
+                        | "azure"
+                        | "battery"
+                        | "docker_context"
+                        | "gcloud"
+                        | "kubernetes"
+                        | "memory_usage"
+                        | "nats"
+                        | "openstack"
+                        | "spack"
+                        | "sudo"
+                )
+            })
             .collect();
 
         assert!(
@@ -351,6 +355,26 @@ mod tests {
                 profile(module),
                 Profile::Live,
                 "{module} depends on per-invocation input and must never be reused",
+            );
+        }
+    }
+
+    #[test]
+    fn user_wide_config_modules_are_never_certified_by_environment_alone() {
+        for module in [
+            "aws",
+            "azure",
+            "docker_context",
+            "gcloud",
+            "kubernetes",
+            "nats",
+            "openstack",
+            "spack",
+        ] {
+            assert_eq!(
+                profile(module),
+                Profile::Sampled,
+                "{module} also reads user-wide configuration files"
             );
         }
     }
