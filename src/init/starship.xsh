@@ -113,11 +113,9 @@ def _starship_reader(proc):
 # firings too (e.g. once per statement in a pasted/compound input), so that
 # guard let every one of them through. Each pass-through kills and relaunches
 # the watcher, and the resulting overlapping `refresh` processes contend
-# for CPU; that contention was observed to make otherwise-fast, never-cached
-# modules (e.g. `time`) occasionally cross the async refresh's slow-module
-# threshold, permanently freezing them in the cache until the next full
-# refresh (see `src/cache.rs`, `SLOW_MODULE_THRESHOLD` in
-# `src/modules/mod.rs`) -- the frozen-clock bug this guards against.
+# for CPU and can leave the next prompt observing an older cache generation.
+# The cache now has explicit dependency validation and never stores live
+# modules (such as `time`), but debouncing still avoids needless work.
 #
 # A wall-clock debounce sidesteps the unreliable history-length signal
 # entirely: real, separate command prompts are always at least this far

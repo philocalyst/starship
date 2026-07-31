@@ -65,6 +65,25 @@ Or for Cmd (Windows) would be adding this line to your `starship.lua`:
 os.setenv('STARSHIP_CACHE', 'C:\\Users\\user\\AppData\\Local\\Temp')
 ```
 
+### Watchman cache validation
+
+Starship can optionally ask an already-running [Watchman](https://facebook.github.io/watchman/)
+instance whether a project tree changed since a cached prompt was refreshed:
+
+```sh
+export STARSHIP_WATCHMAN=1
+```
+
+Starship never starts, owns, or subscribes to Watchman. It invokes the client
+with `--no-spawn`, records a clock only after a complete refresh, and uses a
+short bounded query on later paints. A missing, busy, restarted, or unsupported
+Watchman service simply falls back to ordinary dependency validation; it never
+makes Starship serve a cache entry without proof that it is current.
+
+This is most useful for repository and project-manifest modules: Watchman can
+prove that an entire source tree is unchanged without trying to infer that from
+a directory mtime, which does not change when an existing nested file is edited.
+
 ### Terminology
 
 **Module**: A component in the prompt giving information based on contextual information from your OS. For example, the "nodejs" module shows the version of Node.js that is currently installed on your computer, if your current directory is a Node.js project.
