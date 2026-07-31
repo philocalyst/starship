@@ -181,7 +181,11 @@ pub fn handle<'a>(module: &str, context: &'a Context) -> Option<Module<'a>> {
 fn envelope_for(module: &str, context: &Context) -> Envelope {
     Envelope::new(
         crate::shadow::PKG_VERSION,
-        Envelope::hash_config(context.config.get_module_config(module)),
+        Envelope::hash_module_config(
+            context.config.get_module_config(module),
+            context.config.get_config(&["palette"]),
+            context.config.get_config(&["palettes"]),
+        ),
     )
 }
 

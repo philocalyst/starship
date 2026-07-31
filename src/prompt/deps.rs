@@ -392,9 +392,10 @@ pub struct Envelope {
     /// versions, and this also makes the hash construction itself free to
     /// change: a differently-built key cannot be misread as an old one.
     version: String,
-    /// A hash of the module's own configuration subtree. Scoping this per
-    /// module rather than per file means editing the `[git_status]` table does
-    /// not invalidate every language module in the prompt.
+    /// A hash of the module's own configuration plus palette inputs that its
+    /// stored styles resolve through. Scoping this per module rather than per
+    /// file means editing `[git_status]` does not invalidate every language
+    /// module, while a palette edit safely invalidates styled segments.
     config: String,
 }
 
@@ -410,12 +411,28 @@ impl Envelope {
     /// `None` (no configuration at all) is distinct from an empty table.
     pub fn hash_config(config: Option<&toml::Value>) -> String {
         let mut hasher = Sha1::new();
-        match config {
-            Some(value) => {
-                hasher.update([1u8]);
-                feed_toml_value(&mut hasher, value);
-            }
-            None => hasher.update([0u8]),
+        feed_optional_toml(&mut hasher, config);
+        hex(&hasher.finalize())
+    }
+
+    /// Hash a module's own configuration together with the root palette
+    /// inputs that resolve its stored styles. Segments intentionally retain
+    /// structure, but their `Style` already contains the palette-resolved
+    /// color, so omitting these root fields would replay the old palette after
+    /// an edit.
+    pub fn hash_module_config(
+        module: Option<&toml::Value>,
+        palette: Option<&toml::Value>,
+        palettes: Option<&toml::Value>,
+    ) -> String {
+        let mut hasher = Sha1::new();
+        for (label, value) in [
+            (b"module".as_slice(), module),
+            (b"palette", palette),
+            (b"palettes", palettes),
+        ] {
+            feed_bytes(&mut hasher, label);
+            feed_optional_toml(&mut hasher, value);
         }
         hex(&hasher.finalize())
     }
@@ -423,6 +440,16 @@ impl Envelope {
     fn feed(&self, hasher: &mut Sha1) {
         feed_bytes(hasher, self.version.as_bytes());
         feed_bytes(hasher, self.config.as_bytes());
+    }
+}
+
+fn feed_optional_toml(hasher: &mut Sha1, value: Option<&toml::Value>) {
+    match value {
+        Some(value) => {
+            hasher.update([1u8]);
+            feed_toml_value(hasher, value);
+        }
+        None => hasher.update([0u8]),
     }
 }
 
@@ -603,6 +630,19 @@ mod tests {
             Envelope::hash_config(Some(&first)),
             Envelope::hash_config(Some(&second)),
             "configuration identity follows the TOML tree, not insertion order"
+        );
+    }
+
+    #[test]
+    fn a_palette_change_invalidates_stored_styles() {
+        let module: toml::Value = toml::from_str("style = 'accent'").unwrap();
+        let first_palette: toml::Value = toml::from_str("accent = 'red'").unwrap();
+        let second_palette: toml::Value = toml::from_str("accent = 'blue'").unwrap();
+
+        assert_ne!(
+            Envelope::hash_module_config(Some(&module), None, Some(&first_palette)),
+            Envelope::hash_module_config(Some(&module), None, Some(&second_palette)),
+            "palette resolution happens before a segment is stored"
         );
     }
 

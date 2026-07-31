@@ -58,9 +58,10 @@ pub enum Profile {
 /// producing the [`Deps`] that serve as cache key, watch set, and explanation.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Keying {
-    /// The working directory: its identity, and its own modification time —
-    /// which moves whenever an entry is added or removed, and so detects the
-    /// appearance of the project files a detector looks for.
+    /// The working directory tree. A project module can read the contents of
+    /// an existing manifest (`.nvmrc`, `package.json`, `go.mod`), not merely
+    /// discover that the manifest appeared, so a directory mtime is not a
+    /// sufficient cache condition.
     Dir,
 
     /// The version-control state the working directory sits in: the marker
@@ -105,7 +106,7 @@ impl Keying {
     /// [`Keying::All`] needs no special handling beyond one.
     fn observe_into(&self, context: &Context, builder: DepsBuilder) -> DepsBuilder {
         match self {
-            Self::Dir => builder.path(&context.current_dir),
+            Self::Dir => builder.tree(&context.current_dir),
             Self::Repo => observe_repo(context, builder),
             Self::Toolchain(commands) => commands.iter().fold(
                 Self::Dir.observe_into(context, builder),
@@ -129,12 +130,10 @@ impl Keying {
 /// Watchman-backed tree dependency; without Watchman we recompute rather than
 /// pretend a cheap stat establishes that `git status` is still current.
 fn observe_repo(context: &Context, builder: DepsBuilder) -> DepsBuilder {
-    let builder = builder.path(&context.current_dir);
-
     let Ok(repo) = context.get_repo() else {
-        // Not in a repository. The directory observation above is what detects
-        // one appearing (`git init`, or a `cd` into one).
-        return builder;
+        // Not in a repository. The tree observation detects an initialized
+        // repository or any project file becoming relevant.
+        return builder.tree(&context.current_dir);
     };
 
     let git_dir = &repo.path;
@@ -144,8 +143,12 @@ fn observe_repo(context: &Context, builder: DepsBuilder) -> DepsBuilder {
         .path(git_dir.join("MERGE_HEAD"))
         .path(git_dir.join("REBASE_HEAD"));
     let builder = match &repo.workdir {
+        // The full worktree, not merely cwd: `git status` reports changes
+        // throughout the repository even while the prompt is in a subdir.
         Some(workdir) => builder.tree(workdir),
-        None => builder,
+        // Bare repositories have no ordinary source tree. The git metadata
+        // paths above remain exact, stat-checkable dependencies.
+        None => builder.path(&context.current_dir),
     };
     builder.maybe_mark(
         "workdir",
@@ -364,6 +367,13 @@ mod tests {
             deps.paths().iter().any(|p| p.path == context.current_dir),
             "a version module renders only when the directory looks like that \
              kind of project, so the directory is part of the key",
+        );
+        assert!(
+            deps.paths().iter().any(|p| {
+                p.path == context.current_dir && p.scope == crate::prompt::deps::PathScope::Tree
+            }),
+            "a manifest edit does not update a directory mtime, so project \
+             detection must be Watchman-backed rather than a shallow stat",
         );
         assert!(
             deps.env().iter().any(|e| e.name == "PATH"),
