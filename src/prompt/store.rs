@@ -37,7 +37,7 @@ use super::watchman::ChangeSet;
 /// Bumped when the on-disk shape changes. An unreadable or differently-versioned
 /// snapshot is discarded rather than migrated: the cost of being wrong is a
 /// stale prompt, and the cost of discarding is one slow paint.
-const FORMAT: u32 = 2;
+const FORMAT: u32 = 3;
 
 /// On what terms a stored render may be shown again.
 ///

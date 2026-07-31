@@ -413,9 +413,7 @@ impl Envelope {
         match config {
             Some(value) => {
                 hasher.update([1u8]);
-                // `toml` preserves order (see Cargo.toml), so serializing is
-                // deterministic for a given file.
-                hasher.update(value.to_string().as_bytes());
+                feed_toml_value(&mut hasher, value);
             }
             None => hasher.update([0u8]),
         }
@@ -425,6 +423,51 @@ impl Envelope {
     fn feed(&self, hasher: &mut Sha1) {
         feed_bytes(hasher, self.version.as_bytes());
         feed_bytes(hasher, self.config.as_bytes());
+    }
+}
+
+/// Encode TOML as a typed tree, not its original table ordering. Configuration
+/// files with the same meaning should produce the same cache identity even if
+/// a formatter or an editor reordered their keys.
+fn feed_toml_value(hasher: &mut Sha1, value: &toml::Value) {
+    match value {
+        toml::Value::String(value) => {
+            hasher.update(b"string");
+            feed_bytes(hasher, value.as_bytes());
+        }
+        toml::Value::Integer(value) => {
+            hasher.update(b"integer");
+            feed_bytes(hasher, value.to_string().as_bytes());
+        }
+        toml::Value::Float(value) => {
+            hasher.update(b"float");
+            feed_bytes(hasher, value.to_string().as_bytes());
+        }
+        toml::Value::Boolean(value) => {
+            hasher.update(b"boolean");
+            hasher.update([u8::from(*value)]);
+        }
+        toml::Value::Datetime(value) => {
+            hasher.update(b"datetime");
+            feed_bytes(hasher, value.to_string().as_bytes());
+        }
+        toml::Value::Array(values) => {
+            hasher.update(b"array");
+            hasher.update((values.len() as u64).to_le_bytes());
+            for value in values {
+                feed_toml_value(hasher, value);
+            }
+        }
+        toml::Value::Table(table) => {
+            hasher.update(b"table");
+            hasher.update((table.len() as u64).to_le_bytes());
+            let mut entries: Vec<_> = table.iter().collect();
+            entries.sort_unstable_by(|(left, _), (right, _)| left.cmp(right));
+            for (key, value) in entries {
+                feed_bytes(hasher, key.as_bytes());
+                feed_toml_value(hasher, value);
+            }
+        }
     }
 }
 
@@ -546,6 +589,20 @@ mod tests {
             Envelope::hash_config(None),
             Envelope::hash_config(Some(&toml::Value::Table(toml::Table::new()))),
             "no configuration and an empty table are different states"
+        );
+    }
+
+    #[test]
+    fn config_hash_is_independent_of_table_key_order() {
+        let first: toml::Value =
+            toml::from_str("[module]\nformat = '$x'\ndisabled = false").unwrap();
+        let second: toml::Value =
+            toml::from_str("[module]\ndisabled = false\nformat = '$x'").unwrap();
+
+        assert_eq!(
+            Envelope::hash_config(Some(&first)),
+            Envelope::hash_config(Some(&second)),
+            "configuration identity follows the TOML tree, not insertion order"
         );
     }
 

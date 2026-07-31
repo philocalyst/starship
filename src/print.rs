@@ -158,19 +158,14 @@ pub fn refresh_and_poke(properties: Properties, watch: bool) {
     drop(context);
 
     let store = Store::default_location();
-    if refresh(properties, &store) && !poke() {
-        return;
-    }
-
-    if !watch || interval == 0 {
-        return;
-    }
-
     loop {
-        std::thread::sleep(Duration::from_secs(interval));
-        if !poke() {
+        if refresh(properties.clone(), &store) && !poke() {
             return;
         }
+        if !watch || interval == 0 {
+            return;
+        }
+        std::thread::sleep(Duration::from_secs(interval));
     }
 }
 
