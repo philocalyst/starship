@@ -395,20 +395,20 @@ but only while visible and included in the prompt's format.
 
 ### Options
 
-| Option | Default | Description |
-| --- | --- | --- |
-| `enabled` | `true` | Enable streaming refinements. |
-| `bus` | `100` | Maximum grouping delay in milliseconds. |
-| `adaptive` | `true` | Group refinements from session timings. |
+| Option     | Default | Description                             |
+| ---------- | ------- | --------------------------------------- |
+| `enabled`  | `true`  | Enable streaming refinements.           |
+| `bus`      | `100`   | Maximum grouping delay in milliseconds. |
+| `adaptive` | `true`  | Group refinements from session timings. |
 
 ### `[async.dynamic]`
 
-| Option | Default | Description |
-| --- | --- | --- |
-| `time` | `1000` | Clock refresh interval in milliseconds. |
-| `battery` | `30000` | Battery refresh interval in milliseconds. |
-| `memory_usage` | `5000` | Memory refresh interval in milliseconds. |
-| `localip` | `30000` | Address refresh interval in milliseconds. |
+| Option         | Default | Description                               |
+| -------------- | ------- | ----------------------------------------- |
+| `time`         | `1000`  | Clock refresh interval in milliseconds.   |
+| `battery`      | `30000` | Battery refresh interval in milliseconds. |
+| `memory_usage` | `5000`  | Memory refresh interval in milliseconds.  |
+| `localip`      | `30000` | Address refresh interval in milliseconds. |
 
 Intervals must be between 1 and 86,400,000 milliseconds. Invalid values retain
 their defaults. Disable a dynamic module with its own `disabled = true`.
