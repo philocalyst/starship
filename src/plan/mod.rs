@@ -60,12 +60,6 @@ impl fmt::Display for ModuleName {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) struct ModuleSlot(usize);
 
-impl ModuleSlot {
-    pub(crate) fn index(self) -> usize {
-        self.0
-    }
-}
-
 /// The modules that can make a conditional visible.
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 struct Predicate(Vec<ModuleSlot>);
@@ -181,12 +175,6 @@ pub struct ModuleUse {
     /// The module to run.
     pub module: ModuleName,
     slot: ModuleSlot,
-}
-
-impl ModuleUse {
-    pub(crate) fn slot(&self) -> ModuleSlot {
-        self.slot
-    }
 }
 
 /// The prompt, built from configuration alone.
