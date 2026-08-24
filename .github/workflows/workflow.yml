@@ -9,6 +9,15 @@ on:
       - "docs/**"
       - "**.md"
 
+concurrency:
+  # `head_ref` is only set for `pull_request` runs; falling back to
+  # `ref_name` for `push` runs means both event types key on the same
+  # branch name, so a push to an open PR's branch no longer runs the
+  # whole suite twice in parallel, and a force-push cancels the run
+  # it superseded instead of leaving it to finish and confuse things.
+  group: ${{ github.workflow }}-${{ github.head_ref || github.ref_name }}
+  cancel-in-progress: true
+
 env:
   CARGO_INCREMENTAL: 0
   CARGO_NET_RETRY: 10
