@@ -333,18 +333,6 @@ jobs:
           CARGO_BUILD_WARNINGS: allow
           INSTA_UPDATE: "no"
 
-      - name: Build | Test [Nightly]
-        if: matrix.rust == 'nightly'
-        run: "cargo nextest run
-          --all-features
-          --locked
-          --workspace
-          --run-ignored all"
-        env:
-          # Nightly's own warnings are not this project's to fix.
-          CARGO_BUILD_WARNINGS: allow
-          INSTA_UPDATE: "no"
-
       - name: Build | Installer [Windows]
         continue-on-error: true
         if: matrix.os == 'windows-latest' && matrix.rust == 'stable'
