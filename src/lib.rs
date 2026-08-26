@@ -21,7 +21,7 @@ pub mod logger;
 pub mod module;
 pub mod print;
 pub mod stream;
-pub use frame::FrameEncoding;
+pub use frame::ProcessId;
 pub use transport::{StreamingTransport, TransportMismatch};
 
 // `stream` is the only part of the streaming prompt anything outside this
@@ -85,11 +85,9 @@ const MINIMUM_BLOCKING_THREADS: usize = 16;
 
 /// The most blocking threads to allocate, whatever the processor count.
 ///
-/// The pool is built eagerly on every prompt, so each thread costs startup
-/// time (measured: 8 to 44 threads added ~1ms on an 11-processor machine) —
-/// cheap against what a slow module saves, but not free. Sixty-four also
-/// exceeds the number of modules a single prompt could plausibly block on, so
-/// raising it further would only add startup cost.
+/// Sixty-four exceeds the number of files a worktree walk usefully splits
+/// across on any machine starship runs on, so raising it further would only add
+/// contention.
 const MAXIMUM_BLOCKING_THREADS: usize = 64;
 
 /// Return the number of threads starship should use, if configured.
@@ -121,13 +119,13 @@ fn thread_count() -> ThreadCount {
     thread_count_from(num_configured_starship_threads(), processor_count())
 }
 
-/// Return the maximum number of threads for the global thread-pool.
+/// The most threads `gix` may use to walk an index and worktree.
 ///
-/// Module rendering is overwhelmingly blocking I/O (only 26 of 104 modules are
-/// [`Cadence::Instant`]), so sizing the pool to the processor count would force
-/// a prompt with more deferred modules than cores through several rounds of
-/// `command_timeout` in sequence; it is sized for blocking work instead.
-pub fn num_rayon_threads() -> usize {
+/// Module rendering no longer draws on this: every module gets a thread of its
+/// own for as long as it runs, so there is no pool left to size. What remains is
+/// the one place a library asks starship how much parallelism it may take, and
+/// the `STARSHIP_NUM_THREADS` that used to size the pool still answers it.
+pub fn max_worktree_walk_threads() -> usize {
     thread_count().get()
 }
 
