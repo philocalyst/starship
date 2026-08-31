@@ -382,7 +382,10 @@ modules resolve. The final prompt is identical to a synchronous render.
 | -------------------------------------------------------- | --------------------------------------------------------------------- |
 | zsh                                                      | Changed cells are repainted in place.                                 |
 | fish                                                     | The complete prompt is replaced.                                      |
-| Nushell main                                             | The complete prompt is replaced with its unreleased async prompt API. |
+| PowerShell                                               | The complete main prompt is replaced through PSReadLine events.       |
+| Cmd with Clink 1.8+                                      | Main and right prompts are replaced through Clink prompt coroutines.  |
+| Nushell                                                  | The complete prompt is replaced with its unreleased async prompt API. |
+| Xonsh                                                    | The complete prompt is replaced through prompt-toolkit.               |
 | bash with [ble.sh](https://github.com/akinomyoga/ble.sh) | The complete prompt is replaced.                                      |
 | Stock Bash and other shells                              | The prompt remains synchronous.                                       |
 

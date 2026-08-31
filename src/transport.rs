@@ -22,19 +22,13 @@ impl Tier {
         match shell {
             Shell::Zsh => Self::CellPrecise,
 
-            Shell::Fish => Self::PromptReplace,
+            Shell::Pwsh | Shell::PowerShell => Self::CellPrecise,
 
-            Shell::Nu => Self::PromptReplace,
+            Shell::Fish | Shell::Nu | Shell::Xonsh | Shell::Cmd => Self::PromptReplace,
 
-            Shell::Elvish | Shell::Xonsh => Self::Static,
+            Shell::Elvish => Self::Static,
 
-            Shell::Bash
-            | Shell::Pwsh
-            | Shell::PowerShell
-            | Shell::Ion
-            | Shell::Tcsh
-            | Shell::Cmd
-            | Shell::Unknown => Self::Static,
+            Shell::Bash | Shell::Ion | Shell::Tcsh | Shell::Unknown => Self::Static,
         }
     }
 
@@ -176,6 +170,8 @@ mod tests {
             let _ = Tier::of(shell);
         }
         assert_eq!(Tier::CellPrecise, Tier::of(Shell::Zsh));
+        assert_eq!(Tier::CellPrecise, Tier::of(Shell::PowerShell));
+        assert_eq!(Tier::CellPrecise, Tier::of(Shell::Pwsh));
     }
 
     /// The shells whose output this change must not alter at all.
@@ -191,16 +187,12 @@ mod tests {
             vec![
                 Shell::Bash,
                 Shell::Ion,
-                Shell::Pwsh,
-                Shell::PowerShell,
                 Shell::Elvish,
                 Shell::Tcsh,
-                Shell::Xonsh,
-                Shell::Cmd,
                 Shell::Unknown,
             ],
             unrefinable,
-            "every shell but zsh, fish and nu is drawn synchronously today"
+            "every shell but zsh, fish, PowerShell, nu, xonsh and Clink is drawn synchronously today"
         );
     }
 
