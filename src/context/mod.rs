@@ -1,5 +1,6 @@
 use crate::config::{ModuleConfig, StarshipConfig};
 use crate::configs::StarshipRootConfig;
+use crate::escaping::Destination;
 use crate::module::Module;
 use crate::utils::{CommandOutput, PathExt, create_command, exec_timeout, read_file};
 
@@ -33,8 +34,12 @@ pub use crate::utils::statusline::{
 };
 
 mod git_repo;
+mod jj_repo;
 
 pub use git_repo::{GitRemote, GitRepo};
+pub use jj_repo::JJRepo;
+#[cfg(test)]
+pub use jj_repo::mock_jj_cmd;
 
 /// Context contains data or common methods that may be used by multiple modules.
 /// The data contained within Context will be relevant to this particular rendering
@@ -59,6 +64,9 @@ pub struct Context<'a> {
 
     /// Private field to store Git information for modules who need it
     git_repo: OnceLock<Result<GitRepo, Box<gix::discover::Error>>>,
+
+    /// Private field to store JJ information for modules who need it
+    jj_repo: OnceLock<Option<JJRepo>>,
 
     /// The shell the user is assumed to be running
     pub shell: Shell,
@@ -129,17 +137,67 @@ impl<'a> Context<'a> {
         )
     }
 
-    /// Create a new instance of Context for the provided directory
+    /// Create a new instance of Context for the provided directory, loading the
+    /// configuration the environment points at.
+    ///
+    /// Unit tests in this crate do not load ambient configuration; external
+    /// test harnesses should use [`Self::new_with_config`] to supply an
+    /// explicit, hermetic configuration.
     pub fn new_with_shell_and_path(
-        mut properties: Properties,
+        properties: Properties,
         shell: Shell,
         target: Target,
         path: PathBuf,
         logical_path: PathBuf,
         env: Env<'a>,
     ) -> Self {
-        let config = StarshipConfig::initialize(get_config_path_os(&env).as_deref());
+        let config = Self::ambient_config(&env);
+        Self::new_with_config(properties, shell, target, path, logical_path, env, config)
+    }
 
+    /// The configuration the ambient environment points at.
+    ///
+    /// The filesystem read only exists in a non-test build. A test build that
+    /// could reach the developer's own `~/.config/starship.toml` would report
+    /// results that depend on their personal dotfiles: a `palette` alone
+    /// redefines every named color a module renders, so a test asserting on
+    /// ANSI yellow sees the palette's truecolor yellow instead. Worse, a
+    /// personal configuration can coincidentally make a genuinely broken module
+    /// render the expected output. Pointing `STARSHIP_CONFIG` elsewhere does not
+    /// help either, because `Env` is a mock in test builds and never forwards
+    /// it.
+    ///
+    /// Unit tests in this crate have no code path to filesystem configuration.
+    /// External test harnesses use [`Self::new_with_config`] to make the same
+    /// hermetic guarantee. That constructor also ensures everything derived
+    /// from configuration — `root_config` today, whatever is added tomorrow —
+    /// comes from the supplied configuration rather than a leftover ambient
+    /// setting.
+    fn ambient_config(env: &Env<'a>) -> StarshipConfig {
+        #[cfg(test)]
+        {
+            let _ = env;
+            StarshipConfig { config: None }
+        }
+        #[cfg(not(test))]
+        StarshipConfig::initialize(get_config_path_os(env).as_deref())
+    }
+
+    /// Create a new instance of Context for the provided directory from an
+    /// explicitly supplied, fully owned configuration.
+    ///
+    /// Everything the context derives from configuration is derived here, so a
+    /// caller that supplies a configuration gets a context consistent with it —
+    /// there is no second step to forget.
+    pub fn new_with_config(
+        mut properties: Properties,
+        shell: Shell,
+        target: Target,
+        path: PathBuf,
+        logical_path: PathBuf,
+        env: Env<'a>,
+        config: StarshipConfig,
+    ) -> Self {
         // If the vector is zero-length, we should pretend that we didn't get a
         // pipestatus at all (since this is the input `--pipestatus=""`)
         if properties
@@ -179,6 +237,7 @@ impl<'a> Context<'a> {
             logical_dir,
             dir_contents: OnceLock::new(),
             git_repo: OnceLock::new(),
+            jj_repo: OnceLock::new(),
             shell,
             target,
             width,
@@ -193,6 +252,14 @@ impl<'a> Context<'a> {
             claude_code_data: None,
             _marker: PhantomData,
         }
+    }
+
+    /// Where the prompt rendered from this context is going.
+    ///
+    /// Defaults to the prompt variable of [`Self::shell`], because that is
+    /// where every prompt starship has ever printed goes.
+    pub fn destination(&self) -> Destination {
+        Destination::shell_prompt_variable(self.shell)
     }
 
     /// Sets the context config, overwriting the existing config
@@ -401,6 +468,16 @@ impl<'a> Context<'a> {
             })
             .as_ref()
             .map_err(std::convert::AsRef::as_ref)
+    }
+
+    /// Will lazily discover Jujutsu repo root when a module requests it.
+    pub fn get_jj_repo(&self) -> Option<&JJRepo> {
+        self.jj_repo.get_or_init(|| JJRepo::discover(self)).as_ref()
+    }
+
+    #[cfg(test)]
+    pub fn set_jj_repo(&mut self, repo: JJRepo) {
+        self.jj_repo = OnceLock::from(Some(repo));
     }
 
     pub fn dir_contents(&self) -> Result<&DirContents, &std::io::Error> {

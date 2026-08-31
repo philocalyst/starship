@@ -965,6 +965,20 @@
         "detect_folders": []
       }
     },
+    "jj_bookmark": {
+      "$ref": "#/$defs/JJBookmarkConfig",
+      "default": {
+        "format": "on [$symbol$bookmark(@$remote)$diverged( \\(+$overflow_count others\\))]($style) ",
+        "symbol": " ",
+        "style": "bold purple",
+        "truncation_length": 65535,
+        "truncation_symbol": "…",
+        "diverged_symbol": "*",
+        "ignore_names": [],
+        "ignore_remotes": [],
+        "disabled": false
+      }
+    },
     "jobs": {
       "$ref": "#/$defs/JobsConfig",
       "default": {
@@ -1747,7 +1761,8 @@
         "symbol": "🧙 ",
         "style": "bold blue",
         "allow_windows": false,
-        "disabled": true
+        "disabled": true,
+        "use_legacy_check": false
       }
     },
     "swift": {
@@ -4454,6 +4469,66 @@
       },
       "additionalProperties": false
     },
+    "JJBookmarkConfig": {
+      "type": "object",
+      "properties": {
+        "format": {
+          "description": "Format string for the module",
+          "type": "string",
+          "default": "on [$symbol$bookmark(@$remote)$diverged( \\(+$overflow_count others\\))]($style) "
+        },
+        "symbol": {
+          "description": "`$symbol` in the module's format",
+          "type": "string",
+          "default": " "
+        },
+        "style": {
+          "description": "`$style` in the module's format",
+          "type": "string",
+          "default": "bold purple"
+        },
+        "truncation_length": {
+          "description": "Truncate bookmark names and remotes if they're longer",
+          "type": "integer",
+          "format": "uint16",
+          "minimum": 0,
+          "maximum": 65535,
+          "default": 65535
+        },
+        "truncation_symbol": {
+          "description": "Symbol used to signify truncation was used",
+          "type": "string",
+          "default": "…"
+        },
+        "diverged_symbol": {
+          "description": "Symbol added at the end of a bookmark's string if it has diverged from its remote state",
+          "type": "string",
+          "default": "*"
+        },
+        "ignore_names": {
+          "description": "Ignore bookmarks with this name\n\nUseful to filter out items like `main`, `master` or `develop` that are often default\nbookmarks you don't advance manually.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "ignore_remotes": {
+          "description": "Ignore bookmarks with this remote\n\nUseful to filter out items like `main@upstream` when you develop in a fork.",
+          "type": "array",
+          "items": {
+            "type": "string"
+          },
+          "default": []
+        },
+        "disabled": {
+          "description": "Disable the module",
+          "type": "boolean",
+          "default": false
+        }
+      },
+      "additionalProperties": false
+    },
     "JobsConfig": {
       "type": "object",
       "properties": {
@@ -6631,6 +6706,10 @@
         "disabled": {
           "type": "boolean",
           "default": true
+        },
+        "use_legacy_check": {
+          "type": "boolean",
+          "default": false
         }
       },
       "additionalProperties": false
