@@ -6,13 +6,16 @@ use std::sync::mpsc;
 use std::time::{Duration, Instant};
 
 use crate::context::Context;
-use crate::plan::{ModuleName, ModuleUse, Plan, PromptState};
+use crate::module::{ALL_MODULES, Module};
+use crate::modules::{Cadence, cadence};
+use crate::plan::{ModuleName, ModuleSlot, ModuleUse, Plan, PromptState};
 use crate::segment::Segment;
 
 /// Whether a resolution belongs to the first render or a later poll.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ResolutionKind {
     Initial,
+    Refresh,
 }
 
 /// One resolved module.
@@ -25,11 +28,11 @@ pub struct Resolution<'plan> {
 
 impl fmt::Debug for Resolution<'_> {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let value: String = self.segments.iter().map(Segment::value).collect();
+        let stringified_value: String = self.segments.iter().map(Segment::value).collect();
         formatter
             .debug_struct("Resolution")
             .field("module", &self.module.module.as_str())
-            .field("value", &value)
+            .field("value", &stringified_value)
             .field("elapsed", &self.elapsed)
             .field("kind", &self.kind)
             .finish()
@@ -37,6 +40,7 @@ impl fmt::Debug for Resolution<'_> {
 }
 
 impl<'plan> Resolution<'plan> {
+    #[inline]
     fn initial(module: &'plan ModuleUse, segments: Vec<Segment>, elapsed: Duration) -> Self {
         Self {
             module,
@@ -46,6 +50,32 @@ impl<'plan> Resolution<'plan> {
         }
     }
 
+    #[inline]
+    pub fn module(&self) -> &'plan ModuleName {
+        &self.module.module
+    }
+
+    #[inline]
+    pub fn elapsed(&self) -> Duration {
+        self.elapsed
+    }
+
+    #[inline]
+    pub(crate) fn kind(&self) -> ResolutionKind {
+        self.kind
+    }
+
+    #[inline]
+    pub(crate) fn slot(&self) -> ModuleSlot {
+        self.module.slot()
+    }
+
+    #[inline]
+    pub(crate) fn is_empty(&self) -> bool {
+        self.segments.is_empty()
+    }
+
+    #[inline]
     pub fn store_in(self, state: &mut PromptState<'plan>) {
         state
             .record(self.module, self.segments)
@@ -57,22 +87,93 @@ impl<'plan> Resolution<'plan> {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Selection {
     EveryModule,
+    InstantOnly,
+    DeferredOnly,
 }
 
 impl Selection {
-    fn admits(self, _module: &str) -> bool {
-        match self {
-            Self::EveryModule => true,
+    fn admits(self, module_name: &str) -> bool {
+        let is_instant = cadence(module_name) == Some(Cadence::Instant);
+        matches!(
+            (self, is_instant),
+            (Self::EveryModule, _) | (Self::InstantOnly, true) | (Self::DeferredOnly, false)
+        )
+    }
+}
+
+pub fn modules(plan: &Plan, selection: Selection) -> impl Iterator<Item = &ModuleName> {
+    selected_modules(plan, selection).map(|module_use| &module_use.module)
+}
+
+/// A dynamic module and its refresh period.
+#[derive(Clone)]
+pub struct DynamicModule<'plan> {
+    module: &'plan ModuleUse,
+    referenced_modules: &'plan BTreeSet<ModuleName>,
+    period: Duration,
+}
+
+impl<'plan> DynamicModule<'plan> {
+    #[inline]
+    pub fn name(&self) -> &'plan ModuleName {
+        &self.module.module
+    }
+
+    #[inline]
+    pub fn period(&self) -> Duration {
+        self.period
+    }
+
+    #[inline]
+    pub(crate) fn slot(&self) -> ModuleSlot {
+        self.module.slot()
+    }
+
+    #[must_use]
+    pub fn every(mut self, period: Duration) -> Self {
+        self.period = period;
+        self
+    }
+
+    pub fn resolve(&self, context: &Context) -> Resolution<'plan> {
+        let start_time = Instant::now();
+        let segments = render_module(self.module, context, self.referenced_modules);
+
+        Resolution {
+            module: self.module,
+            segments,
+            elapsed: start_time.elapsed(),
+            kind: ResolutionKind::Refresh,
         }
     }
 }
 
+/// The plan's dynamic modules, in prompt order, skipping any that are disabled.
+pub fn dynamic_modules<'plan>(plan: &'plan Plan, context: &Context) -> Vec<DynamicModule<'plan>> {
+    let referenced_modules = plan.referenced_modules();
+
+    selected_modules(plan, Selection::DeferredOnly)
+        .filter(|module_use| !is_switched_off(&module_use.module, context))
+        .filter_map(|module_use| {
+            let Some(Cadence::Dynamic { period }) = cadence(module_use.module.as_str()) else {
+                return None;
+            };
+            Some(DynamicModule {
+                module: module_use,
+                referenced_modules,
+                period,
+            })
+        })
+        .collect()
+}
+
+// A disabled dynamic module must not be polled forever.
+fn is_switched_off(module_name: &ModuleName, context: &Context) -> bool {
+    let string_name = module_name.as_str();
+    context.is_module_disabled_in_config(string_name)
+}
+
 /// The modules of `plan` that `selection` covers, in first-paint order.
-///
-/// The plan already reports each of its modules exactly once, however many
-/// positions name it — see [`Plan::module_uses`] — so a module is run once and
-/// its value stands in all of them, which is what the formatter did when it
-/// cached one value per variable name.
 fn selected_modules(plan: &Plan, selection: Selection) -> impl Iterator<Item = &ModuleUse> {
     plan.module_uses()
         .iter()
@@ -82,9 +183,7 @@ fn selected_modules(plan: &Plan, selection: Selection) -> impl Iterator<Item = &
 /// What taking from a [`Resolutions`] produced.
 #[derive(Debug)]
 pub enum Arrival<'plan> {
-    /// A module finished.
     Resolved(Resolution<'plan>),
-    /// Every module has finished; there will be no further arrivals.
     Finished,
 }
 
@@ -101,66 +200,110 @@ pub struct Resolutions<'plan> {
 }
 
 impl<'plan> Resolutions<'plan> {
-    /// Waits for the next module to finish, however long that takes.
     pub fn next_arrival(&self) -> Arrival<'plan> {
-        match self.receiver.recv() {
-            Ok(resolution) => Arrival::Resolved(resolution),
-            Err(mpsc::RecvError) => Arrival::Finished,
-        }
+        self.receiver
+            .recv()
+            .map_or(Arrival::Finished, Arrival::Resolved)
     }
 }
 
-/// Runs the selected modules and lets `consume` take their output as it
-/// arrives.
-///
-/// Every selected module produces exactly one arrival, including one that
-/// produced nothing: "this module resolved to nothing" is information a caller
-/// repainting a prompt needs just as much as a value is.
-///
-/// `consume` runs on the calling thread and returns when it stops taking; the
-/// modules still running are waited for before this returns, so nothing outlives
-/// the call.
+pub struct Spawner<'borrow, 'scope, 'context> {
+    scope: &'borrow rayon::Scope<'scope>,
+    sender: mpsc::Sender<Resolution<'scope>>,
+    context: &'scope Context<'context>,
+}
+
+impl<'scope, 'context> Spawner<'_, 'scope, 'context> {
+    pub fn poll(&self, module: DynamicModule<'scope>) {
+        let sender = self.sender.clone();
+        let context = self.context;
+
+        self.scope.spawn(move |_| {
+            let _ = sender.send(module.resolve(context));
+        });
+    }
+}
+
+/// Spawns `module_use`'s render on `scope`, sending the result through `sender`.
+fn spawn_resolution<'scope, 'context>(
+    scope: &rayon::Scope<'scope>,
+    sender: mpsc::Sender<Resolution<'scope>>,
+    module_use: &'scope ModuleUse,
+    context: &'scope Context<'context>,
+    referenced_modules: &'scope BTreeSet<ModuleName>,
+) {
+    scope.spawn(move |_| {
+        let start_time = Instant::now();
+        let segments = render_module(module_use, context, referenced_modules);
+        let _ = sender.send(Resolution::initial(
+            module_use,
+            segments,
+            start_time.elapsed(),
+        ));
+    });
+}
+
+/// Runs the selected modules, delivering each one's output to `arrivals` as it finishes.
+pub fn while_running<'scope, 'context, T>(
+    plan: &'scope Plan,
+    context: &'scope Context<'context>,
+    selection: Selection,
+    arrivals: &mpsc::Sender<Resolution<'scope>>,
+    body: impl FnOnce(&Spawner<'_, 'scope, 'context>) -> T,
+) -> T {
+    let referenced_modules = plan.referenced_modules();
+
+    rayon::in_place_scope(|scope| {
+        for module_use in selected_modules(plan, selection) {
+            spawn_resolution(
+                scope,
+                arrivals.clone(),
+                module_use,
+                context,
+                referenced_modules,
+            );
+        }
+
+        body(&Spawner {
+            scope,
+            sender: arrivals.clone(),
+            context,
+        })
+    })
+}
+
+/// Runs the selected modules and lets `consume` take their output as it arrives.
 pub fn with_resolutions<'plan, T>(
     plan: &'plan Plan,
-    context: &Context,
+    context: &'plan Context<'_>,
     selection: Selection,
     consume: impl FnOnce(&Resolutions<'plan>) -> T,
 ) -> T {
-    let selected = selected_modules(plan, selection);
     let referenced_modules = plan.referenced_modules();
     let (sender, receiver) = mpsc::channel::<Resolution<'plan>>();
 
-    // `in_place_scope` rather than `scope`: the body runs on the calling thread
-    // instead of being migrated into the pool, which is what lets `consume` be
-    // an ordinary closure borrowing whatever the caller is filling in. `scope`
-    // would demand a `Send` closure and a shared, locked accumulator for no
-    // benefit — the receiving side is not the work.
     rayon::in_place_scope(|scope| {
-        for module_use in selected {
-            let sender = sender.clone();
-            scope.spawn(move |_| {
-                let started = Instant::now();
-                let segments = render_module(module_use, context, referenced_modules);
-                // The receiver lives as long as this scope, so a send can only
-                // fail once `consume` has returned — in which case there is
-                // nothing left to report the result to.
-                let _ = sender.send(Resolution::initial(module_use, segments, started.elapsed()));
-            });
+        for module_use in selected_modules(plan, selection) {
+            spawn_resolution(
+                scope,
+                sender.clone(),
+                module_use,
+                context,
+                referenced_modules,
+            );
         }
-        // Every remaining sender is owned by a spawned worker, so the channel
-        // disconnects — and [`Arrival::Finished`] appears — exactly when the
-        // last of them has finished. Dropping this one is what makes that true.
+
+        // Drop our sender so the receiver ends once every worker's clone is dropped too.
         drop(sender);
 
         consume(&Resolutions { receiver })
     })
 }
 
-/// Runs the selected modules, handing each one's output to `receive` as soon as
-/// that module finishes.
+/// Runs the selected modules, handing each one's output to `receive` as soon as it finishes.
 pub fn stream<'plan>(
     plan: &'plan Plan,
-    context: &Context,
+    context: &'plan Context<'_>,
     selection: Selection,
     mut receive: impl FnMut(Resolution<'plan>),
 ) {
@@ -171,8 +314,31 @@ pub fn stream<'plan>(
     });
 }
 
+/// Runs everything the very first paint of a prompt may show.
+pub fn stream_instant<'plan>(
+    plan: &'plan Plan,
+    context: &'plan Context<'_>,
+    mut receive: impl FnMut(Resolution<'plan>),
+) {
+    // Approximations are Instant by contract, so they run synchronously rather
+    // than paying for a rayon task each.
+    selected_modules(plan, Selection::DeferredOnly)
+        .filter_map(|module_use| {
+            let start_time = Instant::now();
+            let approximation = approximate_module(&module_use.module, context)?;
+            Some(Resolution::initial(
+                module_use,
+                approximation.segments,
+                start_time.elapsed(),
+            ))
+        })
+        .for_each(&mut receive);
+
+    stream(plan, context, Selection::InstantOnly, receive);
+}
+
 /// Runs every module the plan asks for and takes their output into one render.
-pub fn fill_slots<'plan>(plan: &'plan Plan, context: &Context) -> PromptState<'plan> {
+pub fn fill_slots<'plan>(plan: &'plan Plan, context: &'plan Context<'_>) -> PromptState<'plan> {
     let mut state = PromptState::empty(plan);
     stream(plan, context, Selection::EveryModule, |resolution| {
         resolution.store_in(&mut state);
@@ -182,16 +348,31 @@ pub fn fill_slots<'plan>(plan: &'plan Plan, context: &Context) -> PromptState<'p
 
 /// The segments one module contributes to the prompt.
 fn render_module(
-    module: &ModuleUse,
+    module_use: &ModuleUse,
     context: &Context,
     referenced_modules: &BTreeSet<ModuleName>,
 ) -> Vec<Segment> {
-    crate::print::handle_module(module.module.as_str(), context, referenced_modules)
+    crate::print::handle_module(module_use.module.as_str(), context, referenced_modules)
         .into_iter()
         .flat_map(|module| module.segments)
         .collect()
 }
 
+/// The instant approximation of one module, or `None` if it has none, is
+/// unrecognised, or is disabled.
+fn approximate_module<'context>(
+    module_name: &ModuleName,
+    context: &'context Context<'_>,
+) -> Option<Module<'context>> {
+    let string_name = module_name.as_str();
+
+    let is_enabled =
+        ALL_MODULES.contains(&string_name) && !context.is_module_disabled_in_config(string_name);
+
+    is_enabled
+        .then(|| crate::modules::instant(string_name, context))
+        .flatten()
+}
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -206,6 +387,28 @@ mod tests {
             context.destination(),
             &context.target,
         ))
+    }
+
+    /// The names of the modules a selection runs, in completion order.
+    fn resolved_modules(context: &Context, selection: Selection) -> Vec<String> {
+        let plan = plan_of(context);
+        let mut resolved = Vec::new();
+        stream(&plan, context, selection, |resolution| {
+            resolved.push(resolution.module().as_str().to_owned());
+        });
+        resolved
+    }
+
+    #[test]
+    fn every_module_of_the_plan_is_reported_exactly_once() {
+        let context = default_context().set_config(toml::toml! {
+            format = "$character$character$status$hostname"
+        });
+        let mut resolved = resolved_modules(&context, Selection::EveryModule);
+        resolved.sort_unstable();
+
+        // `character` fills two slots but is run once.
+        assert_eq!(vec!["character", "hostname", "status"], resolved);
     }
 
     #[test]
@@ -270,6 +473,29 @@ mod tests {
     }
 
     #[test]
+    fn the_instant_selection_and_its_complement_partition_the_plan() {
+        let context = default_context().set_config(toml::toml! {
+            format = "$character$directory$status$git_branch"
+        });
+
+        let mut instant = resolved_modules(&context, Selection::InstantOnly);
+        let mut deferred = resolved_modules(&context, Selection::DeferredOnly);
+        instant.sort_unstable();
+        deferred.sort_unstable();
+
+        assert_eq!(vec!["character", "status"], instant);
+        assert_eq!(vec!["directory", "git_branch"], deferred);
+    }
+
+    #[test]
+    fn an_empty_selection_runs_nothing() {
+        let context = default_context().set_config(toml::toml! {
+            format = "$directory"
+        });
+        assert!(resolved_modules(&context, Selection::InstantOnly).is_empty());
+    }
+
+    #[test]
     fn streaming_and_filling_agree() {
         let context = default_context().set_config(toml::toml! {
             add_newline = false
@@ -288,6 +514,74 @@ mod tests {
         assert_eq!(
             crate::module::painted::Painted::paint(&filled.render(), None).to_markup(),
             crate::module::painted::Painted::paint(&streamed.render(), None).to_markup(),
+        );
+    }
+
+    #[test]
+    fn a_dynamic_module_is_found_among_the_deferred_ones() {
+        let context = default_context().set_config(toml::toml! {
+            format = "$time$character"
+            [time]
+            disabled = false
+            format = "$time"
+        });
+        let plan = plan_of(&context);
+
+        let found = dynamic_modules(&plan, &context);
+        assert_eq!(1, found.len());
+        assert_eq!("time", found[0].name().as_str());
+        assert_eq!(Duration::from_secs(1), found[0].period());
+    }
+
+    #[test]
+    fn a_prompt_with_nothing_dynamic_in_it_has_no_dynamic_modules() {
+        let context = default_context().set_config(toml::toml! {
+            format = "$character$directory$git_branch"
+        });
+        assert!(dynamic_modules(&plan_of(&context), &context).is_empty());
+    }
+
+    #[test]
+    fn a_dynamic_module_can_be_given_a_different_period() {
+        let context = default_context().set_config(toml::toml! {
+            format = "$time"
+            [time]
+            disabled = false
+        });
+        let plan = plan_of(&context);
+        let module = dynamic_modules(&plan, &context)
+            .into_iter()
+            .next()
+            .expect("time is dynamic")
+            .every(Duration::from_millis(250));
+
+        assert_eq!(Duration::from_millis(250), module.period());
+    }
+
+    #[test]
+    fn resolving_a_dynamic_module_produces_a_value_the_prompt_renders() {
+        let context = default_context().set_config(toml::toml! {
+            add_newline = false
+            format = "$time"
+            [time]
+            disabled = false
+            format = "the-time"
+        });
+        let plan = plan_of(&context);
+        let module = dynamic_modules(&plan, &context)
+            .into_iter()
+            .next()
+            .expect("time is dynamic");
+
+        let resolution = module.resolve(&context);
+        assert_eq!("time", resolution.module().as_str());
+        assert_eq!(ResolutionKind::Refresh, resolution.kind());
+        let mut state = PromptState::empty(&plan);
+        resolution.store_in(&mut state);
+
+        assert_eq!(
+            "the-time",
+            crate::module::painted::Painted::paint(&state.render(), None).to_string()
         );
     }
 }
